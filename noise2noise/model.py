@@ -31,9 +31,9 @@ from ema_pytorch import EMA
 
 from accelerate import Accelerator
 
-from Diffusion_denoising_thin_slice.noise2noise.attend import Attend
-import Diffusion_denoising_thin_slice.functions_collection as ff
-import Diffusion_denoising_thin_slice.Data_processing as Data_processing
+from .attend import Attend
+from .. import functions_collection as ff
+from .. import Data_processing as Data_processing
 
 
 # constants
@@ -616,12 +616,12 @@ class Trainer(object):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
 
-    def train(self, pre_trained_model = None ,start_step = None):
+    def train(self, pre_trained_model = None, start_step = None):
 
         accelerator = self.accelerator
         device = accelerator.device
 
-        # load pre-trained
+        #load pre-trained
         if pre_trained_model is not None:
             self.load_model(pre_trained_model)
             print('model loaded from ', pre_trained_model)
@@ -631,59 +631,102 @@ class Trainer(object):
 
         training_log = []
         val_loss = np.inf
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-            
+        
+        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
+
             while self.step < self.train_num_steps:
                 print('training epoch: ', self.step + 1)
                 print('learning rate: ', self.scheduler.get_last_lr()[0])
 
                 average_loss = []
                 count = 1
+                self.opt.zero_grad()  # 在epoch开始时清零
+                
                 # load data
-                for batch in self.dl:
-                    if count == 1 or count % self.accum_iter == 1 or count == len(self.dl) - 1 or count == len(self.dl):
-                        self.opt.zero_grad()
-         
+                for batch_idx, batch in enumerate(self.dl):
+
                     # load data
                     batch_input, batch_gt = batch 
                     data_input = batch_input.to(device)
                     data_gt = batch_gt.to(device)
+                    
+                    # 检查输入数据是否存在nan，若存在则跳过batch
+                    if torch.any(torch.isnan(data_input)) or torch.any(torch.isinf(data_input)):
+                        print(f"Warning: NaN or Inf in input data at batch {batch_idx}")
+                        continue
+                    if torch.any(torch.isnan(data_gt)) or torch.any(torch.isinf(data_gt)):
+                        print(f"Warning: NaN or Inf in ground truth at batch {batch_idx}")
+                        continue
 
-                    with self.accelerator.autocast():
+                    with self.accelerator.autocast():#启用自动混合精度训练(AMP)
                         output = self.model(data_input)
                         
-                        # loss
-                        loss = self.loss_function1(output, data_gt) + self.loss_function2(output, data_gt)
+                        # 检查输出是否存在nan，若存在则打印范围并跳过
+                        if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
+                            print(f"Warning: NaN or Inf in model output at batch {batch_idx}")
+                            print(f"Input range: [{data_input.min():.4f}, {data_input.max():.4f}]")
+                            print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
+                            continue
                         
-                    # accumulate the gradient, typically used when batch size is small
-                    if count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
-                        self.accelerator.backward(loss)
+                        # loss - 除以累积步数来平均
+                        loss = (self.loss_function1(output, data_gt) + self.loss_function2(output, data_gt)) / self.accum_iter
+                        
+                        # 检查loss是否存在nan，若存在则打印范围并跳过batch
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"Warning: NaN or Inf in loss at batch {batch_idx}")
+                            print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
+                            print(f"GT range: [{data_gt.min():.4f}, {data_gt.max():.4f}]")
+                            continue
+
+                    # 累积梯度
+                    self.accelerator.backward(loss)
+                    
+                    count += 1
+                    average_loss.append(loss.item() * self.accum_iter)  # 恢复真实loss值用于记录
+                    
+                    # 每accum_iter步或最后一个batch时更新参数
+                    if count % self.accum_iter == 0 or batch_idx == len(self.dl) - 1:
                         accelerator.wait_for_everyone()
+                        
+                        # 检查梯度
+                        total_norm = 0
+                        for p in self.model.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** 0.5
+                        
+                        if np.isnan(total_norm) or np.isinf(total_norm):
+                            print(f"Warning: NaN or Inf in gradients, skipping update")
+                            self.opt.zero_grad()
+                            continue
+                        
                         accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.opt.step()
+                        self.opt.zero_grad()
 
-                    count += 1
-                    average_loss.append(loss.item())
-
-                   
+                if len(average_loss) == 0:
+                    print("Error: No valid batches in this epoch!")
+                    continue
+                    
                 average_loss = sum(average_loss) / len(average_loss)
                 pbar.set_description(f'average loss: {average_loss:.4f}')
-               
+                
                 accelerator.wait_for_everyone()
 
                 self.step += 1
 
                 # save the model
-                if self.step !=0 and divisible_by(self.step, self.save_model_every):
-                   self.save(self.step)
+                if self.step != 0 and divisible_by(self.step, self.save_model_every):
+                    self.save(self.step)
                 
-                if self.step !=0 and divisible_by(self.step, self.train_lr_decay_every):
+                if self.step != 0 and divisible_by(self.step, self.train_lr_decay_every):
                     self.scheduler.step()
                     
                 self.ema.update()
 
                 # do the validation if necessary
-                if self.step !=0 and divisible_by(self.step, self.validation_every):
+                if self.step != 0 and divisible_by(self.step, self.validation_every):
                     print('validation at step: ', self.step)
                     self.model.eval()
                     with torch.no_grad():
@@ -692,23 +735,36 @@ class Trainer(object):
                             batch_input, batch_gt = batch 
                             data_input = batch_input.to(device)
                             data_gt = batch_gt.to(device)
+                            
+                            if torch.any(torch.isnan(data_input)) or torch.any(torch.isnan(data_gt)):
+                                continue
+                                
                             with self.accelerator.autocast():
                                 output = self.model(data_input)
+                                if torch.any(torch.isnan(output)):
+                                    continue
                                 loss = self.loss_function1(output, data_gt) + self.loss_function2(output, data_gt)
-                            
-                            val_loss.append(loss.item())
-                        val_loss = sum(val_loss) / len(val_loss)
-                        print('validation loss: ', val_loss)
+                                if not torch.isnan(loss):
+                                    val_loss.append(loss.item())
+                        
+                        if len(val_loss) > 0:
+                            val_loss = sum(val_loss) / len(val_loss)
+                            print('validation loss: ', val_loss)
+                        else:
+                            val_loss = np.inf
+                            print('validation loss: Invalid (all NaN)')
                     self.model.train(True)
 
                 # save the training log
-                training_log.append([self.step,self.scheduler.get_last_lr()[0],average_loss,val_loss])
-                df = pd.DataFrame(training_log,columns = ['iteration','learning_rate','training_loss','validation_loss'])
-                log_folder = os.path.join(os.path.dirname(self.results_folder),'log');ff.make_folder([log_folder])
-                df.to_excel(os.path.join(log_folder, 'training_log.xlsx'),index=False)
+                training_log.append([self.step, self.scheduler.get_last_lr()[0], average_loss, val_loss])
+                df = pd.DataFrame(training_log, columns=['iteration', 'learning_rate', 'training_loss', 'validation_loss'])
+                log_folder = os.path.join(os.path.dirname(self.results_folder), 'log')
+                ff.make_folder([log_folder])
+                df.to_excel(os.path.join(log_folder, 'training_log.xlsx'), index=False)
                         
                 # at the end of each epoch, call on_epoch_end
-                self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
+                self.ds.on_epoch_end()
+                self.ds_val.on_epoch_end()
 
                 pbar.update(1)
 
