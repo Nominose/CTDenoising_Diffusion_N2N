@@ -856,3 +856,38 @@ class Sampler(object):
         # print('final image shape: ', pred_img.shape)
       
         return pred_img
+
+    @torch.inference_mode()
+    def export_stage1_cache(self, trained_model_filename, save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        self.load_model(trained_model_filename)
+        device = self.device
+        self.ema.ema_model.eval()
+
+        def _spatial_mean(x):
+            # 本模型是 2D，(B,C,H,W)
+            return x.mean(dim=(2,3), keepdim=True)
+
+        idx = 0
+        for batch in self.dl:
+            # 兼容 (input, gt) 或只有 input 的数据集
+            if isinstance(batch, (list, tuple)):
+                batch_input = batch[0]
+            else:
+                batch_input = batch
+
+            x = batch_input.to(device)          # noisy 输入
+            y_bar = self.ema.ema_model(x)       # Φ(x) = ȳ
+            eps = x - y_bar                     # 残差
+            mu = _spatial_mean(eps)             # 残差空间均值
+            eps0 = eps - mu                     # 零均值残差
+            y_bar0 = y_bar + mu                 # 保持 x = ȳ0 + ε̄0
+
+            torch.save({
+                'y_bar':  y_bar0.detach().cpu().float(),
+                'eps_bar': eps0.detach().cpu().float()
+            }, os.path.join(save_dir, f'stage1_{idx:06d}.pt'))
+            idx += 1
+
+
+
