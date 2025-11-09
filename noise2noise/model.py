@@ -865,29 +865,27 @@ class Sampler(object):
         self.ema.ema_model.eval()
 
         def _spatial_mean(x):
-            # 本模型是 2D，(B,C,H,W)
-            return x.mean(dim=(2,3), keepdim=True)
+            # 2D: (B, C, H, W)
+            return x.mean(dim=(2, 3), keepdim=True)
 
         idx = 0
         for batch in self.dl:
-            # 兼容 (input, gt) 或只有 input 的数据集
-            if isinstance(batch, (list, tuple)):
-                batch_input = batch[0]
-            else:
-                batch_input = batch
+            # 你的 Dataset_2D 返回 (input, output) = (相邻两张, 中心 noisy)
+            batch_input, batch_gt = batch      # <--- 直接解包
+            x_noisy = batch_gt.to(device)      # (B,1,H,W) 作为 x
+            y_bar  = self.ema.ema_model(batch_input.to(device))  # (B,1,H,W)
 
-            x = batch_input.to(device)          # noisy 输入
-            y_bar = self.ema.ema_model(x)       # Φ(x) = ȳ
-            eps = x - y_bar                     # 残差
-            mu = _spatial_mean(eps)             # 残差空间均值
-            eps0 = eps - mu                     # 零均值残差
-            y_bar0 = y_bar + mu                 # 保持 x = ȳ0 + ε̄0
+            eps = x_noisy - y_bar
+            mu  = _spatial_mean(eps)           # 残差在 H,W 上的均值
+            eps0   = eps - mu                  # 零均值残差
+            y_bar0 = y_bar + mu                # 保持 x = ȳ0 + ε̄0 恒等式
 
             torch.save({
                 'y_bar':  y_bar0.detach().cpu().float(),
                 'eps_bar': eps0.detach().cpu().float()
             }, os.path.join(save_dir, f'stage1_{idx:06d}.pt'))
             idx += 1
+
 
 
 
