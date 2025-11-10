@@ -688,7 +688,9 @@ class GaussianDiffusion(nn.Module):
 
         self.objective = objective
 
-        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v', 'forward_recon'}, \
+    'objective must be one of pred_noise / pred_x0 / pred_v / forward_recon'
+
 
         # clip to stablize
         self.clip_or_not = clip_or_not
@@ -774,6 +776,9 @@ class GaussianDiffusion(nn.Module):
             register_buffer('loss_weight', maybe_clipped_snr)
         elif objective == 'pred_v':
             register_buffer('loss_weight', maybe_clipped_snr / (snr + 1))
+        elif objective == 'forward_recon':
+            register_buffer('loss_weight', maybe_clipped_snr / snr)
+
 
         # auto-normalization of data [0, 1] -> [-1, 1] - can turn off by setting it to be False
 
@@ -851,6 +856,32 @@ class GaussianDiffusion(nn.Module):
             x_start = self.predict_start_from_v(x, t, v)
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
+        elif self.objective == 'forward_recon':
+            # 训练时：输入 x_start 当作观测 x_obs；条件也传 x_obs
+            # 目标是反解出来的 “真实 eps*”： eps* = (x_obs - sqrt(alpha_bar_t)*ȳ) / sqrt(1 - alpha_bar_t)
+            # 这里简化为：把 ȳ 也放在 condition 里（训练数据生成器要把 ȳ 拼到 condition 通道）
+            if not self.conditional_diffusion or (condition is None):
+                raise ValueError('forward_recon 需要 conditional_diffusion 且提供 condition')
+
+            # 用当前 t 反解 eps*：这里的 x = q_sample(x_start, t, noise) 已经是 x_t，
+            # 但 forward_recon 目标是用观测 x_obs 直接反解，因此改用 “输入张量本身” 作为 x_obs
+            x_obs = x_start
+
+            # 把 condition 的第一个通道当作 ȳ（你数据集里按这个约定）
+            y_bar = condition[:, :1, ...]
+            a = extract(self.sqrt_alphas_cumprod, t, x_obs.shape)
+            b = extract(self.sqrt_one_minus_alphas_cumprod, t, x_obs.shape)
+
+            target = (x_obs - a * y_bar) / (b + 1e-8)
+
+            # 模型前向用 x_obs 和 condition
+            model_out = self.model(x_obs, t, condition)
+            # 后面一样做 MSE 与加权
+            loss = F.mse_loss(model_out, target, reduction='none')
+            loss = reduce(loss, 'b ... -> b (...)', 'mean')
+            loss = loss * extract(self.loss_weight, t, loss.shape)
+            return loss.mean(), model_out, target
+
 
         return ModelPrediction(pred_noise, x_start)  # if prediction = ModelPrediction(pred_noise = a, x_start = b), then prediction.pred_noise = a, prediction.x_start = b
 
@@ -1207,12 +1238,36 @@ class Trainer(object):
                     if count == 0 or count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
                         self.opt.zero_grad()
 
-                    batch_x0, batch_condition = batch
+                    # --- 解包：兼容 (x0, cond) 或 (x0, cond, eps) ---
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        batch_x0, batch_condition, batch_eps = batch
+                    else:
+                        batch_x0, batch_condition = batch
+                        batch_eps = None
+
                     data_x0 = batch_x0.to(device)
                     data_condition = batch_condition.to(device) if self.conditional_diffusion else None
 
+                    # --- 噪声来源：用缓存 eps；若无则退回 None（内部会用 randn）---
+                    noise = None
+                    if batch_eps is not None:
+                        noise = batch_eps.to(device)                       # [B,1,H,W]
+                        # 保险：再做一次逐样本空间零均值（即使缓存已做过）
+                        noise = noise - noise.mean(dim=(2,3), keepdim=True)
+                        # 可选：单位方差
+                        # noise = noise / (noise.std(dim=(2,3), keepdim=True) + 1e-6)
+
+                        # 关键：batch 维 shuffle（打乱噪声与图像配对）
+                        idx = torch.randperm(noise.size(0), device=device)
+                        noise = noise[idx]
+
                     with self.accelerator.autocast():
-                        diffusion_loss,model_output, target = self.model(img = data_x0, condition = data_condition)
+                        diffusion_loss, model_output, target = self.model(
+                            img = data_x0,
+                            condition = data_condition,
+                            noise = noise,              # <- 把自定义噪声喂进来
+                        )
+
                         # bias loss
                         gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
                         lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
@@ -1394,3 +1449,76 @@ class Sampler(object):
         print('final image shape: ', pred_img.shape)
       
         return pred_img
+
+
+        @torch.inference_mode()
+        def reconstruct_2D_one_step(self, trained_model_filename, ybar_img, xobs_img, t_star='auto', t_candidates=None):
+            """
+            ybar_img:  Stage-I 输出（与 x_obs 对齐的 ȳ），shape [H,W,Z]
+            xobs_img:  观测噪声图 x_obs，shape [H,W,Z]
+            t_star:    'auto' 或具体整数（0..T-1）
+            t_candidates: 自动匹配用的候选步（list[int]）
+            """
+            self.load_model(trained_model_filename)
+            device = self.device
+            self.ema.ema_model.eval()
+
+            # 取扩散常数
+            sqrt_acp   = self.ema.ema_model.sqrt_alphas_cumprod
+            sqrt_omacp = self.ema.ema_model.sqrt_one_minus_alphas_cumprod
+            T = sqrt_acp.shape[0]
+
+            if t_candidates is None:
+                t_candidates = list(range(50, T, 50)) + [T-1]
+
+            def _estimate_t_star(yb, xo):
+                best = (1e9, 0)
+                yb_t = torch.from_numpy(yb).float().to(device).unsqueeze(0).unsqueeze(0)
+                xo_t = torch.from_numpy(xo).float().to(device).unsqueeze(0).unsqueeze(0)
+                for t in t_candidates:
+                    a = sqrt_acp[t].item()
+                    b = sqrt_omacp[t].item()
+                    eps = (xo_t - a * yb_t) / (b + 1e-8)
+                    m = eps.mean().abs().item()
+                    s = eps.std().abs().item()
+                    score = m + abs(s - 1.)
+                    if score < best[0]:
+                        best = (score, t)
+                return best[1]
+
+            H, W, Z = xobs_img.shape
+            out = np.zeros_like(xobs_img, dtype=np.float32)
+
+            for z in range(Z):
+                yb = ybar_img[:, :, z]
+                xo = xobs_img[:, :, z]
+
+                if isinstance(t_star, str) and t_star == 'auto':
+                    t_opt = _estimate_t_star(yb, xo)
+                else:
+                    t_opt = int(t_star)
+
+                xo_t = torch.from_numpy(xo).float().to(device).unsqueeze(0).unsqueeze(0)
+                yb_t = torch.from_numpy(yb).float().to(device).unsqueeze(0).unsqueeze(0)
+                cond = torch.cat([yb_t, xo_t], dim=1)  # 约定 condition = [ȳ, x_obs]
+
+                tvec = torch.full((1,), t_opt, dtype=torch.long, device=device)
+
+                # 预测 eps_hat
+                eps_hat = self.ema.ema_model.model(xo_t, tvec, cond)
+
+                a = sqrt_acp[t_opt].to(eps_hat.device).view(1,1,1,1)
+                b = sqrt_omacp[t_opt].to(eps_hat.device).view(1,1,1,1)
+
+                x0_hat = (xo_t - b * eps_hat) / (a + 1e-8)
+
+                out[:, :, z] = x0_hat.squeeze().detach().cpu().numpy().astype(np.float32)
+
+            out = Data_processing.crop_or_pad(out, [H, W, Z], value=np.min(xobs_img))
+            out = Data_processing.normalize_image(out, normalize_factor=self.normalize_factor,
+                                                image_max=self.maximum_cutoff, image_min=self.background_cutoff,
+                                                invert=True)
+            if self.histogram_equalization:
+                out = Data_processing.apply_transfer_to_img(out, self.bins, self.bins_mapped, reverse=True)
+            out = Data_processing.correct_shift_caused_in_pad_crop_loop(out)
+            return out

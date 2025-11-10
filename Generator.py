@@ -242,4 +242,45 @@ class Dataset_2D(Dataset):
     def on_epoch_end(self):
         print('now run on_epoch_end function')
         self.index_array = self.generate_index_array()
+
+class Stage2FromStage1Cache(Dataset):
+    """
+    读取 N2N 导出的 stage1_cache/*.pt，返回：
+      x_start   = x_obs        -> (1, H, W)
+      condition = [y_bar, x_obs] 在通道维拼接 -> (2, H, W)
+      eps       = eps_bar      -> (1, H, W)  (可选，若你想把“实测噪声”喂给 p_losses)
+    """
+    def __init__(self, stage1_cache_dirs, shuffle=True):
+        super().__init__()
+        self.pt_files = []
+        for d in stage1_cache_dirs:
+            if not os.path.isdir(d):
+                continue
+            fs = sorted([os.path.join(d, f) for f in os.listdir(d) if f.endswith('.pt')])
+            self.pt_files.extend(fs)
+        if shuffle:
+            rng = np.random.default_rng()
+            rng.shuffle(self.pt_files)
+
+    def __len__(self):
+        return len(self.pt_files)
+
+    def __getitem__(self, idx):
+        pack = torch.load(self.pt_files[idx])
+        # 期望键：'y_bar', 'x_obs', 'eps_bar'
+        y_bar = pack['y_bar'].float().squeeze(0)   # (1,H,W)
+        x_obs = pack['x_obs'].float().squeeze(0)   # (1,H,W)
+        eps   = pack.get('eps_bar', None)
+        if eps is not None:
+            eps = eps.float().squeeze(0)           # (1,H,W)
+
+        # DDM2 训练约定：
+        x_start   = x_obs                           # 作为“干净图像”的代理
+        condition = torch.cat([y_bar, x_obs], dim=0)   # (2,H,W)
+
+        if eps is None:
+            return x_start, condition
+        else:
+            return x_start, condition, eps
+
     
