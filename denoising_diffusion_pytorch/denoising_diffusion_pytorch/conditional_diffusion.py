@@ -1038,62 +1038,58 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, condition = None,noise = None, offset_noise_strength = None):# gt_for_mask = None, loss_weight_class = None):
-        '''loss_weight_class is a list of [loss for bone, loss for brain, loss for air]'''
-        if self.problem_dimension == '2D':
-            b,c,h,w = x_start.shape
-        else:
-            b, c, h, w ,d = x_start.shape
 
-        noise = default(noise, lambda: torch.randn_like(x_start))
+    def p_losses(self, y_bar, original_X, t):
+        """
+        y_bar: N2N 输出，形状 [B, 1, H, W]
+        original_X: 原始 noisy 输入 X，形状 [B, 1, H, W]
+        t: 每个样本的时间步，形状 [B]
+        """
 
-        # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
+        # 1. 估计噪声残差 eps_bar = X - y_bar
+        eps_bar = original_X - y_bar              # [B,1,H,W]
 
-        offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
+        # 2. batch 维度 shuffle 一下，做 J-invariance
+        idx = torch.randperm(eps_bar.size(0), device=eps_bar.device)
+        eps_shuf = eps_bar[idx]                  # [B,1,H,W]
 
-        if offset_noise_strength > 0.:
-            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
-            noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1 1')
+        # 3. 取 sqrt(alpha_bar_t) 并广播到图像大小
+        a = extract(self.sqrt_alphas_cumprod, t, original_X.shape)  # [B,1,1,1]
 
-        # noise sample
+        # 4. 构造 S_t = sqrt(alpha_bar_t) * y_bar + eps_shuf
+        S_t = a * y_bar + eps_shuf               # [B,1,H,W]
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
+        # 5. 网络从 S_t 直接预测 X
+        #    注意：这里不再用 condition
+        model_out = self.model(S_t, t)           # Unet 输入 (x, time)
 
-        # predict and take gradient step
-        if self.conditional_diffusion:
-            if exists(condition) == 0:
-                raise ValueError('conditional diffusion is specified, but no condition is provided')
-            model_out = self.model(x, t, condition)
-        else:
-            model_out = self.model(x, t)
+        target = original_X                      # 论文里的 X
 
-        if self.objective == 'pred_noise':
-            target = noise
-        elif self.objective == 'pred_x0':
-            target = x_start
-        elif self.objective == 'pred_v':
-            v = self.predict_v(x_start, t, noise)
-            target = v
-        else:
-            raise ValueError(f'unknown objective {self.objective}')
-        
-        loss = F.mse_loss(model_out, target, reduction = 'none')  #reduction='none' argument ensures that the loss is computed element-wise, without any reduction across batches.
-        loss = reduce(loss, 'b ... -> b (...)', 'mean') # reduce() operates on the batch dimension (b) and potentially other dimensions (...). It reduces the loss tensor to have the same shape as the target tensor, with a mean reduction.
-        loss = loss * extract(self.loss_weight, t, loss.shape)  # assign different loss weight to different timesteps
+        # 6. 加权 MSE
+        loss = F.mse_loss(model_out, target, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
 
-        return loss.mean(),model_out, target
-    
-    def forward(self, img, condition = None, *args, **kwargs):
-        if self.problem_dimension == '2D':
-            b,c,h,w,device, img_size = *img.shape, img.device, self.image_size
-        else:
-            b, c, h, w, d, device, img_size, = *img.shape, img.device, self.image_size
+        return loss.mean(), model_out, target
 
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long() 
 
-        loss, model_out, target = self.p_losses(img, t, condition, *args, **kwargs)
-        return loss, model_out, target
    
+    
+    def forward(self, y_bar, original_X, *args, **kwargs):
+        # 这里用 original_X 的 shape 来确定 batch 大小
+        if self.problem_dimension == '2D':
+            b, c, h, w = original_X.shape
+            device = original_X.device
+        else:
+            b, c, h, w, d = original_X.shape
+            device = original_X.device
+
+        # 随机采样 t
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+
+        loss, model_out, target = self.p_losses(y_bar, original_X, t)
+        return loss, model_out, target
+
 
 # trainer class
 class Trainer(object):
@@ -1211,92 +1207,75 @@ class Trainer(object):
 
 
     def train(self, pre_trained_model = None ,start_step = None, beta = 0):
-        accelerator = self.accelerator
-        device = accelerator.device
+            accelerator = self.accelerator
+            device = accelerator.device
 
-        # load pre-trained
-        if pre_trained_model is not None:
-            self.load_model(pre_trained_model)
-            print('model loaded from ', pre_trained_model)
+            # load pre-trained
+            if pre_trained_model is not None:
+                self.load_model(pre_trained_model)
+                print('model loaded from ', pre_trained_model)
 
-        if start_step is not None:
-            self.step = start_step
-        
-        self.scheduler.step_size = 1
-        val_loss = np.inf; val_diffusion_loss = np.inf; val_bias_loss = np.inf
-        training_log = []
-
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            if start_step is not None:
+                self.step = start_step
             
-            while self.step < self.train_num_steps:
-                print('training epoch: ', self.step + 1)
-                print('learning rate: ', self.scheduler.get_last_lr()[0])
+            self.scheduler.step_size = 1
+            val_loss = np.inf; val_diffusion_loss = np.inf; val_bias_loss = np.inf
+            training_log = []
 
-                average_loss = []; average_diffusion_loss = []; average_bias_loss = []
-                count = 0
-                for batch in self.dl:
-                    if count == 0 or count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
-                        self.opt.zero_grad()
+            with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+                
+                while self.step < self.train_num_steps:
+                    print('training epoch: ', self.step + 1)
+                    print('learning rate: ', self.scheduler.get_last_lr()[0])
 
-                    # --- 解包：兼容 (x0, cond) 或 (x0, cond, eps) ---
-                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                        batch_x0, batch_condition, batch_eps = batch
-                    else:
-                        batch_x0, batch_condition = batch
-                        batch_eps = None
+                    average_loss = []; average_diffusion_loss = []; average_bias_loss = []
+                    count = 0
+                    for batch in self.dl:
+                        if count == 0 or count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
+                            self.opt.zero_grad()
 
-                    data_x0 = batch_x0.to(device)
-                    data_condition = batch_condition.to(device) if self.conditional_diffusion else None
+                        # dataloader 返回: (y_bar, X_original)
+                        batch_ybar, batch_x_orig = batch
 
-                    # --- 噪声来源：用缓存 eps；若无则退回 None（内部会用 randn）---
-                    noise = None
-                    if batch_eps is not None:
-                        noise = batch_eps.to(device)                       # [B,1,H,W]
-                        # 保险：再做一次逐样本空间零均值（即使缓存已做过）
-                        noise = noise - noise.mean(dim=(2,3), keepdim=True)
-                        # 可选：单位方差
-                        # noise = noise / (noise.std(dim=(2,3), keepdim=True) + 1e-6)
+                        y_bar = batch_ybar.to(device)        # N2N 输出
+                        x_orig = batch_x_orig.to(device)     # 原始 noisy X
 
-                        # 关键：batch 维 shuffle（打乱噪声与图像配对）
-                        idx = torch.randperm(noise.size(0), device=device)
-                        noise = noise[idx]
+                        with self.accelerator.autocast():
+                            # 调用我们新定义的 forward(y_bar, original_X)
+                            diffusion_loss, model_output, target = self.model(
+                                y_bar, 
+                                x_orig
+                            )
 
-                    with self.accelerator.autocast():
-                        diffusion_loss, model_output, target = self.model(
-                            img = data_x0,
-                            condition = data_condition,
-                            noise = noise,              # <- 把自定义噪声喂进来
-                        )
+                            # bias loss 部分保持不变，用 X 做低频对齐
+                            gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
+                            lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
+                            lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
 
-                        # bias loss
-                        gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                        lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                        lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(data_x0), gauss_kernel)
+                            bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
 
-                        bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
+                            loss = diffusion_loss + beta * bias_loss
 
-                        loss = diffusion_loss + beta * bias_loss
+                        if count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
+                            self.accelerator.backward(loss)
+                            accelerator.wait_for_everyone()
+                            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                            self.opt.step()
 
-                    if count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
-                        self.accelerator.backward(loss)
-                        accelerator.wait_for_everyone()
-                        accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.opt.step()
-                    
-                    average_loss.append(loss.item())
-                    average_diffusion_loss.append(diffusion_loss.item())
-                    average_bias_loss.append(bias_loss.item())
-                    count += 1 
+                        average_loss.append(loss.item())
+                        average_diffusion_loss.append(diffusion_loss.item())
+                        average_bias_loss.append(bias_loss.item())
+                        count += 1
 
-                average_loss = sum(average_loss) / len(average_loss)
-                average_diffusion_loss = sum(average_diffusion_loss) / len(average_diffusion_loss)
-                average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
-            
-                pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}, bias loss: {average_bias_loss:.4f}')
+                    average_loss = sum(average_loss) / len(average_loss)
+                    average_diffusion_loss = sum(average_diffusion_loss) / len(average_diffusion_loss)
+                    average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
+                
+                    pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}, bias loss: {average_bias_loss:.4f}')
 
-                accelerator.wait_for_everyone()
+                    accelerator.wait_for_everyone()
 
-                self.step += 1
+                    self.step += 1
 
                 # save the model
                 if self.step !=0 and divisible_by(self.step, self.save_model_every):
