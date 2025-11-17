@@ -1040,38 +1040,29 @@ class GaussianDiffusion(nn.Module):
 
 
     def p_losses(self, y_bar, original_X, t):
-        """
-        y_bar: N2N 输出，形状 [B, 1, H, W]
-        original_X: 原始 noisy 输入 X，形状 [B, 1, H, W]
-        t: 每个样本的时间步，形状 [B]
-        """
+        eps_bar = original_X - y_bar          # [B,1,H,W]
 
-        # 1. 估计噪声残差 eps_bar = X - y_bar
-        eps_bar = original_X - y_bar              # [B,1,H,W]
+        B = eps_bar.size(0)
+        idx = torch.randperm(B, device=eps_bar.device)
+        eps_shuf = eps_bar[idx]              # [B,1,H,W]
 
-        # 2. batch 维度 shuffle 一下，做 J-invariance
-        idx = torch.randperm(eps_bar.size(0), device=eps_bar.device)
-        eps_shuf = eps_bar[idx]                  # [B,1,H,W]
+        # 对应 x_t = sqrt(alphā_t) ȳ + sqrt(1-alphā_t) * noise_t
+        # 希望 x_t 等于 sqrt(alphā_t) ȳ + eps_shuf
+        # => noise_t = eps_shuf / sqrt(1-alphā_t)
+        b = extract(self.sqrt_one_minus_alphas_cumprod, t, original_X.shape)  # [B,1,1,1]
+        noise_t = eps_shuf / (b + 1e-8)
 
-        # 3. 取 sqrt(alpha_bar_t) 并广播到图像大小
-        a = extract(self.sqrt_alphas_cumprod, t, original_X.shape)  # [B,1,1,1]
+        # 用统一的 q_sample 来生成 S_t
+        S_t = self.q_sample(x_start=y_bar, t=t, noise=noise_t)
 
-        # 4. 构造 S_t = sqrt(alpha_bar_t) * y_bar + eps_shuf
-        S_t = a * y_bar + eps_shuf               # [B,1,H,W]
+        model_out = self.model(S_t, t)  # Unet(S_t, t)
+        target = original_X
 
-        # 5. 网络从 S_t 直接预测 X
-        #    注意：这里不再用 condition
-        model_out = self.model(S_t, t)           # Unet 输入 (x, time)
-
-        target = original_X                      # 论文里的 X
-
-        # 6. 加权 MSE
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss * extract(self.loss_weight, t, loss.shape)
 
         return loss.mean(), model_out, target
-
 
    
     
@@ -1241,13 +1232,12 @@ class Trainer(object):
                         x_orig = batch_x_orig.to(device)     # 原始 noisy X
 
                         with self.accelerator.autocast():
-                            # 调用我们新定义的 forward(y_bar, original_X)
+                            # 调用新定义的 forward(y_bar, original_X)
                             diffusion_loss, model_output, target = self.model(
                                 y_bar, 
                                 x_orig
                             )
 
-                            # bias loss 部分保持不变，用 X 做低频对齐
                             gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
                             lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
                             lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
@@ -1290,21 +1280,30 @@ class Trainer(object):
                 self.ema.update()
 
                 # do the validation if necessary
-                if self.step !=0 and divisible_by(self.step, self.validation_every):
+                if self.step != 0 and divisible_by(self.step, self.validation_every):
                     print('validation at step: ', self.step)
                     self.model.eval()
                     with torch.no_grad():
                         val_loss = []; val_diffusion_loss = []; val_bias_loss = []
+
                         for batch in self.dl_val:
-                            batch_x0, batch_condition = batch
-                            data_x0 = batch_x0.to(device)
-                            data_condition = batch_condition.to(device) if self.conditional_diffusion else None
+                            # ★ 新的数据格式：dataloader 返回 (y_bar, X_original)
+                            batch_ybar, batch_x_orig = batch
+
+                            y_bar  = batch_ybar.to(device)   # N2N 输出 ȳ
+                            x_orig = batch_x_orig.to(device) # 原始 noisy X
+
                             with self.accelerator.autocast():
-                                diffusion_loss,model_output, target = self.model(img = data_x0, condition = data_condition)
-                                # bias loss
-                                gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                                lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                                lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(data_x0), gauss_kernel)
+                                # ★ 调用你新的 forward(y_bar, original_X)
+                                diffusion_loss, model_output, target = self.model(
+                                    y_bar,
+                                    x_orig
+                                )
+
+                                # bias loss 部分保持不变，只是目标从 data_x0 换成 x_orig
+                                gauss_kernel   = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
+                                lowpass_out    = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
+                                lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
 
                                 bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
 
@@ -1314,12 +1313,14 @@ class Trainer(object):
                             val_diffusion_loss.append(diffusion_loss.item())
                             val_bias_loss.append(bias_loss.item())
 
-                        val_loss = sum(val_loss) / len(val_loss)
+                        val_loss           = sum(val_loss) / len(val_loss)
                         val_diffusion_loss = sum(val_diffusion_loss) / len(val_diffusion_loss)
-                        val_bias_loss = sum(val_bias_loss) / len(val_bias_loss)
+                        val_bias_loss      = sum(val_bias_loss) / len(val_bias_loss)
+
                         print('validation loss: ', val_loss, 
-                              'validation diffusion loss: ', val_diffusion_loss,
-                              'validation bias loss: ', val_bias_loss)
+                            'validation diffusion loss: ', val_diffusion_loss,
+                            'validation bias loss: ', val_bias_loss)
+
                     self.model.train(True)
 
                 # save the training log
