@@ -25,3 +25,20 @@ class Build():
         ground_truth_file_list = np.asarray(c['ground_truth_file']) 
         
         return batch_list, patient_id_list, patient_subid_list, random_num_list, noise_file_list, ground_truth_file_list
+        
+    def __build__xingyi(self,batch_list):
+        for b in range(len(batch_list)):
+            cases = self.data.loc[self.data['batch'] == batch_list[b]]
+            if b == 0:
+                c = cases.copy()
+            else:
+                c = pd.concat([c,cases])
+
+        batch_list = np.asarray(c['batch'])
+        patient_id_list = np.asarray(c['Patient_ID'])
+        patient_subid_list = np.asarray(c['Patient_subID'])
+        random_num_list = np.asarray(c['random_num'])
+        x_original_file_list = np.asarray(c['x_original_file'])
+        y_bar_file_list = np.asarray(c['y_bar_file']) 
+        
+        return batch_list, patient_id_list, patient_subid_list, random_num_list, x_original_file_list, y_bar_file_list

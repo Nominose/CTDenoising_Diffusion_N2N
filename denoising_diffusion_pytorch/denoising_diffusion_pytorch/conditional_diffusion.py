@@ -1009,24 +1009,24 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f'unknown problem dimension {self.problem_dimension}')
       
     @torch.inference_mode()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
-        b, *_, device = *x1.shape, x1.device
-        t = default(t, self.num_timesteps - 1)
+    # def interpolate(self, x1, x2, t = None, lam = 0.5):
+    #     b, *_, device = *x1.shape, x1.device
+    #     t = default(t, self.num_timesteps - 1)
 
-        assert x1.shape == x2.shape
+    #     assert x1.shape == x2.shape
 
-        t_batched = torch.full((b,), t, device = device)
-        xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
+    #     t_batched = torch.full((b,), t, device = device)
+    #     xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
 
-        img = (1 - lam) * xt1 + lam * xt2
+    #     img = (1 - lam) * xt1 + lam * xt2
 
-        x_start = None
+    #     x_start = None
 
-        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
+    #     for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
+    #         self_cond = x_start if self.self_condition else None
+    #         img, x_start = self.p_sample(img, i, self_cond)
 
-        return img
+    #     return img
 
     @autocast(enabled = False)
     def q_sample(self, x_start, t, noise = None):
@@ -1035,25 +1035,38 @@ class GaussianDiffusion(nn.Module):
 
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            eps_shuf
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def q_sample_new(self, x_start, t,lambda1, noise):
+        '''prepare random xt from x_start and t'''
+
+        return (
+            lambda1 * x_start + noise
         )
 
 
     def p_losses(self, y_bar, original_X, t):
-        eps_bar = original_X - y_bar          # [B,1,H,W]
+        eps_bar = original_X - y_bar   
+
+        eps_mean = XXXX
+        eps_bar = eps_bar - eps_mean       
 
         B = eps_bar.size(0)
         idx = torch.randperm(B, device=eps_bar.device)
-        eps_shuf = eps_bar[idx]              # [B,1,H,W]
+        eps_shuf = eps_bar[idx]              
 
-        # 对应 x_t = sqrt(alphā_t) ȳ + sqrt(1-alphā_t) * noise_t
-        # 希望 x_t 等于 sqrt(alphā_t) ȳ + eps_shuf
-        # => noise_t = eps_shuf / sqrt(1-alphā_t)
-        b = extract(self.sqrt_one_minus_alphas_cumprod, t, original_X.shape)  # [B,1,1,1]
-        noise_t = eps_shuf / (b + 1e-8)
+        # calcualte lambda 1 and 2
+        lambda1 = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        lambda2 = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+
+        # y bar
+        y_bar = XXXXXXX lambda1 lambda2
+
 
         # 用统一的 q_sample 来生成 S_t
-        S_t = self.q_sample(x_start=y_bar, t=t, noise=noise_t)
+        S_t = self.q_sample_new(x_start=y_bar, t=t, lambda1 = lambda1, noise = eps_bar)
 
         model_out = self.model(S_t, t)  # Unet(S_t, t)
         target = original_X
@@ -1075,7 +1088,6 @@ class GaussianDiffusion(nn.Module):
             b, c, h, w, d = original_X.shape
             device = original_X.device
 
-        # 随机采样 t
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         loss, model_out, target = self.p_losses(y_bar, original_X, t)
@@ -1238,13 +1250,13 @@ class Trainer(object):
                                 x_orig
                             )
 
-                            gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                            lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                            lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
+                            # gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
+                            # lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
+                            # lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
 
-                            bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
+                            # bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
 
-                            loss = diffusion_loss + beta * bias_loss
+                            loss = diffusion_loss# + beta * bias_loss
 
                         if count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
                             self.accelerator.backward(loss)
@@ -1254,12 +1266,12 @@ class Trainer(object):
 
                         average_loss.append(loss.item())
                         average_diffusion_loss.append(diffusion_loss.item())
-                        average_bias_loss.append(bias_loss.item())
+                        # average_bias_loss.append(bias_loss.item())  # no bias
                         count += 1
 
                     average_loss = sum(average_loss) / len(average_loss)
                     average_diffusion_loss = sum(average_diffusion_loss) / len(average_diffusion_loss)
-                    average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
+                    # average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
                 
                     pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}, bias loss: {average_bias_loss:.4f}')
 
@@ -1287,14 +1299,14 @@ class Trainer(object):
                         val_loss = []; val_diffusion_loss = []; val_bias_loss = []
 
                         for batch in self.dl_val:
-                            # ★ 新的数据格式：dataloader 返回 (y_bar, X_original)
+                            #新的数据格式：dataloader 返回 (y_bar, X_original)
                             batch_ybar, batch_x_orig = batch
 
                             y_bar  = batch_ybar.to(device)   # N2N 输出 ȳ
                             x_orig = batch_x_orig.to(device) # 原始 noisy X
 
                             with self.accelerator.autocast():
-                                # ★ 调用你新的 forward(y_bar, original_X)
+                                # 调用新的 forward(y_bar, original_X)
                                 diffusion_loss, model_output, target = self.model(
                                     y_bar,
                                     x_orig

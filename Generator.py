@@ -45,8 +45,8 @@ def random_translate(i, x_translate = None,  y_translate = None, translate_range
 class Dataset_2D(Dataset):
     def __init__(
         self,
-        img_list,
-        condition_list,
+        y_bar_list
+        original_x_list
         image_size,
 
         num_slices_per_image,
@@ -71,8 +71,8 @@ class Dataset_2D(Dataset):
         augment_frequency = 0,
     ):
         super().__init__()
-        self.img_list = img_list
-        self.condition_list = condition_list
+        self.y_bar_list = y_bar_list
+        self.original_x_list = original_x_list
         self.image_size = image_size
         self.num_slices_per_image = num_slices_per_image
         self.random_pick_slice = random_pick_slice
@@ -92,10 +92,10 @@ class Dataset_2D(Dataset):
         self.num_files = len(img_list)
 
         self.index_array = self.generate_index_array()
-        self.current_x0_file = None
-        self.current_x0_data = None
-        self.current_condition_file = None
-        self.current_condition_data = None
+        self.current_y_bar_file = None
+        self.current_y_bar_data = None
+        self.current_original_x_file = None
+        self.current_original_x_data = None
 
         self.bins = bins
         self.bins_mapped = bins_mapped
@@ -150,18 +150,17 @@ class Dataset_2D(Dataset):
         else:
             f,s = self.index_array[index]
         # print('index is: ', index, ' now we pick file ', f)
-        x0_filename = self.img_list[f]
+        x0_filename = self.y_bar_list[f]
         # print('x0 filename is: ', x0_filename, ' while current x0 file is: ', self.current_x0_file)
-        condition_file = self.condition_list[f]
+        condition_file = self.original_x_list[f]
         # print('condition file is: ', condition_file, ' while current condition file is: ', self.current_condition_file)
 
-        if self.supervision == 'supervised': # in unsupervised case, we do not need to load the x0 file since we don't have clean image
-            # print('we have x0 since we have clean image')
-            if x0_filename != self.current_x0_file:
-                x0_img = self.load_file(x0_filename)
-                # print('load: ',x0_filename)
-                self.current_x0_file = x0_filename
-                self.current_x0_data = np.copy(x0_img)
+        
+        if x0_filename != self.current_x0_file:
+            x0_img = self.load_file(x0_filename)
+            # print('load: ',x0_filename)
+            self.current_x0_file = x0_filename
+            self.current_x0_data = np.copy(x0_img)
 
         if condition_file != self.current_condition_file:
             # print('it is a new case, load the file')
@@ -169,15 +168,11 @@ class Dataset_2D(Dataset):
             self.current_condition_file = condition_file
             self.current_condition_data = np.copy(condition_img)
 
-            if self.supervision == 'unsupervised':
-                self.current_x0_data = np.copy(self.current_condition_data)
-
             # define a list of random slice numbers
             if self.slice_range == None:
-                total_slice_range = [0,self.current_condition_data.shape[2]] if self.supervision == 'supervised' else [0 + 1,self.current_condition_data.shape[2]-1]
+                total_slice_range = [0,self.current_condition_data.shape[2]] 
             else:
                 total_slice_range = self.slice_range
-            # print('in this condition case, total slice range is: ', total_slice_range)
             if self.random_pick_slice == False:
                 self.slice_index_list = np.arange(total_slice_range[0], total_slice_range[1])
                 self.slice_index_list = self.slice_index_list[:self.num_slices_per_image]
@@ -197,24 +192,22 @@ class Dataset_2D(Dataset):
 
         # target image
         x0_image_data = np.copy(self.current_x0_data)[:,:,s] 
-        # if self.target == 'mean':
-        #     x0_image_data = (self.current_x0_data[:,:,s-1] + self.current_x0_data[:,:,s+1]) / 2
         # crop the patch
         if self.num_patches_per_slice != None:
             x0_image_data = x0_image_data[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
         
         # condition image
-        if self.supervision == 'supervised':
-            condition_image_data = np.copy(self.current_condition_data)[:,:,s]
-            if self.num_patches_per_slice != None:
+      
+        condition_image_data = np.copy(self.current_condition_data)[:,:,s]
+        if self.num_patches_per_slice != None:
                 condition_image_data = condition_image_data[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
-        elif self.supervision == 'unsupervised':
-            condition_image_data1 = np.copy(self.current_condition_data)[:,:,s-1]
-            condition_image_data2 = np.copy(self.current_condition_data)[:,:,s+1]
-            if self.num_patches_per_slice != None:
-                condition_image_data1 = condition_image_data1[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
-                condition_image_data2 = condition_image_data2[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
-            condition_image_data = np.stack([condition_image_data1, condition_image_data2], axis = -1)
+        # elif self.supervision == 'unsupervised':
+        #     condition_image_data1 = np.copy(self.current_condition_data)[:,:,s-1]
+        #     condition_image_data2 = np.copy(self.current_condition_data)[:,:,s+1]
+        #     if self.num_patches_per_slice != None:
+        #         condition_image_data1 = condition_image_data1[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
+        #         condition_image_data2 = condition_image_data2[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
+        #     condition_image_data = np.stack([condition_image_data1, condition_image_data2], axis = -1)
           
 
         # augmentation
@@ -228,12 +221,12 @@ class Dataset_2D(Dataset):
         
             
         x0_image_data = torch.from_numpy(x0_image_data).unsqueeze(0).float()
-        if self.supervision == 'supervised':
-            condition_image_data = torch.from_numpy(condition_image_data).unsqueeze(0).float()
-        elif self.supervision == 'unsupervised':
+     
+        condition_image_data = torch.from_numpy(condition_image_data).unsqueeze(0).float()
+        # elif self.supervision == 'unsupervised':
       
-            condition_image_data = np.transpose(condition_image_data, (2,0,1))
-            condition_image_data = torch.from_numpy(condition_image_data).float()
+            # condition_image_data = np.transpose(condition_image_data, (2,0,1))
+            # condition_image_data = torch.from_numpy(condition_image_data).float()
             
 
         # print('shape of x0 image data: ', x0_image_data.shape, ' and condition image data: ', condition_image_data.shape)
@@ -242,45 +235,4 @@ class Dataset_2D(Dataset):
     def on_epoch_end(self):
         print('now run on_epoch_end function')
         self.index_array = self.generate_index_array()
-
-class Stage2FromStage1Cache(Dataset):
-    """
-    读取 N2N 导出的 stage1_cache/*.pt，返回：
-      x_start   = x_obs        -> (1, H, W)
-      condition = [y_bar, x_obs] 在通道维拼接 -> (2, H, W)
-      eps       = eps_bar      -> (1, H, W)  (可选，若你想把“实测噪声”喂给 p_losses)
-    """
-    def __init__(self, stage1_cache_dirs, shuffle=True):
-        super().__init__()
-        self.pt_files = []
-        for d in stage1_cache_dirs:
-            if not os.path.isdir(d):
-                continue
-            fs = sorted([os.path.join(d, f) for f in os.listdir(d) if f.endswith('.pt')])
-            self.pt_files.extend(fs)
-        if shuffle:
-            rng = np.random.default_rng()
-            rng.shuffle(self.pt_files)
-
-    def __len__(self):
-        return len(self.pt_files)
-
-    def __getitem__(self, idx):
-        pack = torch.load(self.pt_files[idx])
-        # 期望键：'y_bar', 'x_obs', 'eps_bar'
-        y_bar = pack['y_bar'].float().squeeze(0)   # (1,H,W)
-        x_obs = pack['x_obs'].float().squeeze(0)   # (1,H,W)
-        eps   = pack.get('eps_bar', None)
-        if eps is not None:
-            eps = eps.float().squeeze(0)           # (1,H,W)
-
-        # DDM2 训练约定：
-        x_start   = x_obs                           # 作为“干净图像”的代理
-        condition = torch.cat([y_bar, x_obs], dim=0)   # (2,H,W)
-
-        if eps is None:
-            return x_start, condition
-        else:
-            return x_start, condition, eps
-
     
