@@ -1048,22 +1048,20 @@ class GaussianDiffusion(nn.Module):
 
 
     def p_losses(self, y_bar, original_X, t):
-        eps_bar = original_X - y_bar   
-
-        eps_mean = XXXX
-        eps_bar = eps_bar - eps_mean       
+        eps_bar = original_X - y_bar         
 
         B = eps_bar.size(0)
         idx = torch.randperm(B, device=eps_bar.device)
-        eps_shuf = eps_bar[idx]              
+        eps_mean = eps_bar[idx]  
+
+        eps_bar = eps_bar - eps_mean             
 
         # calcualte lambda 1 and 2
         lambda1 = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         lambda2 = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
         # y bar
-        y_bar = XXXXXXX lambda1 lambda2
-
+        y_bar = (y_bar + lambda1) / lambda2
 
         # 用统一的 q_sample 来生成 S_t
         S_t = self.q_sample_new(x_start=y_bar, t=t, lambda1 = lambda1, noise = eps_bar)
