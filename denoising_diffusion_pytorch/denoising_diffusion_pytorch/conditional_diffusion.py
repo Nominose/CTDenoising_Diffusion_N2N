@@ -1029,15 +1029,14 @@ class GaussianDiffusion(nn.Module):
     #     return img
 
     @autocast(enabled = False)
-    def q_sample(self, x_start, t, noise = None):
-        '''prepare random xt from x_start and t'''
-        noise = default(noise, lambda: torch.randn_like(x_start))
+    # def q_sample(self, x_start, t, noise = None):
+    #     '''prepare random xt from x_start and t'''
+    #     noise = default(noise, lambda: torch.randn_like(x_start))
 
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            eps_shuf
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
-        )
+    #     return (
+    #         extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + eps_bar
+    #         extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+    #     )
 
     def q_sample_new(self, x_start, t,lambda1, noise):
         '''prepare random xt from x_start and t'''
@@ -1345,7 +1344,7 @@ class Trainer(object):
                 self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
                 pbar.update(1)
 
-        accelerator.print('training complete')
+            accelerator.print('training complete')
 
 
 # Sampling class

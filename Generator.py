@@ -45,8 +45,8 @@ def random_translate(i, x_translate = None,  y_translate = None, translate_range
 class Dataset_2D(Dataset):
     def __init__(
         self,
-        y_bar_list
-        original_x_list
+        y_bar_list,
+        original_x_list,
         image_size,
 
         num_slices_per_image,
