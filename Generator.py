@@ -150,15 +150,15 @@ class Dataset_2D(Dataset):
         else:
             f,s = self.index_array[index]
         # print('index is: ', index, ' now we pick file ', f)
-        x0_filename = self.y_bar_list[f]
-        # print('x0 filename is: ', x0_filename, ' while current x0 file is: ', self.current_x0_file)
-        condition_file = self.original_x_list[f]
-        # print('condition file is: ', condition_file, ' while current condition file is: ', self.current_condition_file)
+        y_bar_filename = self.y_bar_list[f]
+        # print('y_bar_filename is: ', y_bar_file, ' while current y_bar_file is: ', self.current_x0_file)
+        original_x_filename = self.original_x_list[f]
+        # print('original_x file is: ', original_x_file, ' while current original_x file is: ', self.current_condition_file)
 
         
         if y_bar_filename != self.current_y_bar_file:
             y_bar_img = self.load_file(y_bar_filename)
-            # print('load: ',x0_filename)
+            # print('load: ',y_bar_filename)
             self.current_y_bar_file = y_bar_filename
             self.current_y_bar_data = np.copy(y_bar_img)
 
@@ -170,7 +170,7 @@ class Dataset_2D(Dataset):
 
             # define a list of random slice numbers
             if self.slice_range == None:
-                total_slice_range = [0,self.current_condition_data.shape[2]] 
+                total_slice_range = [0,self.current_original_x_data.shape[2]] 
             else:
                 total_slice_range = self.slice_range
             if self.random_pick_slice == False:
@@ -186,7 +186,7 @@ class Dataset_2D(Dataset):
 
         # pick the patch:
         if self.num_patches_per_slice != None:
-            x_shape, y_shape = self.current_condition_data.shape[0], self.current_condition_data.shape[1]
+            x_shape, y_shape = self.current_original_x_data.shape[0], self.current_original_x_data.shape[1]
             random_origin_x, random_origin_y = random.randint(0, x_shape - self.patch_size[0]), random.randint(0, y_shape - self.patch_size[1])
             # print('x range is: ', random_origin_x, random_origin_x + self.patch_size[0], ' and y range is: ', random_origin_y, random_origin_y + self.patch_size[1])
 

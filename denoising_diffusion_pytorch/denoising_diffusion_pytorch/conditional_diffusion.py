@@ -1047,7 +1047,9 @@ class GaussianDiffusion(nn.Module):
 
 
     def p_losses(self, y_bar, original_X, t):
-        eps_bar = original_X - y_bar         
+        x_start = y_bar
+        eps_bar = original_X - y_bar
+        condition = original_X         
 
         B = eps_bar.size(0)
         idx = torch.randperm(B, device=eps_bar.device)
@@ -1065,7 +1067,7 @@ class GaussianDiffusion(nn.Module):
         # 用统一的 q_sample 来生成 S_t
         S_t = self.q_sample_new(x_start=y_bar, t=t, lambda1 = lambda1, noise = eps_bar)
 
-        model_out = self.model(S_t, t)  # Unet(S_t, t)
+        model_out = self.model(S_t, t, condition=condition)  # Unet(S_t, t)
         target = original_X
 
         loss = F.mse_loss(model_out, target, reduction='none')
@@ -1270,81 +1272,80 @@ class Trainer(object):
                     average_diffusion_loss = sum(average_diffusion_loss) / len(average_diffusion_loss)
                     # average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
                 
-                    pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}, bias loss: {average_bias_loss:.4f}')
-
+                    pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}')
                     accelerator.wait_for_everyone()
 
                     self.step += 1
 
-                # save the model
-                if self.step !=0 and divisible_by(self.step, self.save_model_every):
-                   print('i am saving model at step: ', self.step)
-                   self.save(self.step)
-                   print('model saved')
-                # update the parameter
-                if self.step !=0 and divisible_by(self.step, self.train_lr_decay_every):
-                    print('i am updating learning rate at step: ', self.step)
-                    self.scheduler.step()
+                    # save the model
+                    if self.step !=0 and divisible_by(self.step, self.save_model_every):
+                    print('i am saving model at step: ', self.step)
+                    self.save(self.step)
+                    print('model saved')
+                    # update the parameter
+                    if self.step !=0 and divisible_by(self.step, self.train_lr_decay_every):
+                        print('i am updating learning rate at step: ', self.step)
+                        self.scheduler.step()
 
-                self.ema.update()
+                    self.ema.update()
 
-                # do the validation if necessary
-                if self.step != 0 and divisible_by(self.step, self.validation_every):
-                    print('validation at step: ', self.step)
-                    self.model.eval()
-                    with torch.no_grad():
-                        val_loss = []; val_diffusion_loss = []; val_bias_loss = []
+                    # do the validation if necessary
+                    if self.step != 0 and divisible_by(self.step, self.validation_every):
+                        print('validation at step: ', self.step)
+                        self.model.eval()
+                        with torch.no_grad():
+                            val_loss = []; val_diffusion_loss = []; val_bias_loss = []
 
-                        for batch in self.dl_val:
-                            #新的数据格式：dataloader 返回 (y_bar, X_original)
-                            batch_ybar, batch_x_orig = batch
+                            for batch in self.dl_val:
+                                #新的数据格式：dataloader 返回 (y_bar, X_original)
+                                batch_ybar, batch_x_orig = batch
 
-                            y_bar  = batch_ybar.to(device)   # N2N 输出 ȳ
-                            x_orig = batch_x_orig.to(device) # 原始 noisy X
+                                y_bar  = batch_ybar.to(device)   # N2N 输出 ȳ
+                                x_orig = batch_x_orig.to(device) # 原始 noisy X
 
-                            with self.accelerator.autocast():
-                                # 调用新的 forward(y_bar, original_X)
-                                diffusion_loss, model_output, target = self.model(
-                                    y_bar,
-                                    x_orig
-                                )
+                                with self.accelerator.autocast():
+                                    # 调用新的 forward(y_bar, original_X)
+                                    diffusion_loss, model_output, target = self.model(
+                                        y_bar,
+                                        x_orig
+                                    )
 
-                                # bias loss 部分保持不变，只是目标从 data_x0 换成 x_orig
-                                gauss_kernel   = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                                lowpass_out    = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                                lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
+                                    # bias loss 部分保持不变，只是目标从 data_x0 换成 x_orig
+                                    gauss_kernel   = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
+                                    lowpass_out    = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
+                                    lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
 
-                                bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
+                                    bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
 
-                                loss = diffusion_loss + beta * bias_loss
-                            
-                            val_loss.append(loss.item())
-                            val_diffusion_loss.append(diffusion_loss.item())
-                            val_bias_loss.append(bias_loss.item())
+                                    loss = diffusion_loss + beta * bias_loss
+                                
+                                val_loss.append(loss.item())
+                                val_diffusion_loss.append(diffusion_loss.item())
+                                val_bias_loss.append(bias_loss.item())
 
-                        val_loss           = sum(val_loss) / len(val_loss)
-                        val_diffusion_loss = sum(val_diffusion_loss) / len(val_diffusion_loss)
-                        val_bias_loss      = sum(val_bias_loss) / len(val_bias_loss)
+                            val_loss           = sum(val_loss) / len(val_loss)
+                            val_diffusion_loss = sum(val_diffusion_loss) / len(val_diffusion_loss)
+                            val_bias_loss      = sum(val_bias_loss) / len(val_bias_loss)
 
-                        print('validation loss: ', val_loss, 
-                            'validation diffusion loss: ', val_diffusion_loss,
-                            'validation bias loss: ', val_bias_loss)
+                            print('validation loss: ', val_loss, 
+                                'validation diffusion loss: ', val_diffusion_loss,
+                                'validation bias loss: ', val_bias_loss)
 
-                    self.model.train(True)
+                        self.model.train(True)
 
-                # save the training log
-                training_log.append([self.step,self.scheduler.get_last_lr()[0], average_loss, average_diffusion_loss, 
-                                     average_bias_loss, val_loss, val_diffusion_loss, val_bias_loss])
-                df = pd.DataFrame(training_log,columns = ['iteration','learning_rate','training_loss','training_diffusion_loss','training_bias_loss',
-                                                              'validation_loss','validation_diffusion_loss','validation_bias_loss'])
-                log_folder = os.path.join(os.path.dirname(self.results_folder),'log');ff.make_folder([log_folder])
-                df.to_excel(os.path.join(log_folder, 'training_log.xlsx'),index=False)
+                    # save the training log
+                    training_log.append([self.step,self.scheduler.get_last_lr()[0], average_loss, average_diffusion_loss, 
+                                        average_bias_loss, val_loss, val_diffusion_loss, val_bias_loss])
+                    df = pd.DataFrame(training_log,columns = ['iteration','learning_rate','training_loss','training_diffusion_loss','training_bias_loss',
+                                                                'validation_loss','validation_diffusion_loss','validation_bias_loss'])
+                    log_folder = os.path.join(os.path.dirname(self.results_folder),'log');ff.make_folder([log_folder])
+                    df.to_excel(os.path.join(log_folder, 'training_log.xlsx'),index=False)
 
-                # at the end of each epoch, call on_epoch_end
-                self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
-                pbar.update(1)
+                    # at the end of each epoch, call on_epoch_end
+                    self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
+                    pbar.update(1)
 
-            accelerator.print('training complete')
+                accelerator.print('training complete')
 
 
 # Sampling class
@@ -1438,76 +1439,3 @@ class Sampler(object):
         print('final image shape: ', pred_img.shape)
       
         return pred_img
-
-
-        @torch.inference_mode()
-        def reconstruct_2D_one_step(self, trained_model_filename, ybar_img, xobs_img, t_star='auto', t_candidates=None):
-            """
-            ybar_img:  Stage-I 输出（与 x_obs 对齐的 ȳ），shape [H,W,Z]
-            xobs_img:  观测噪声图 x_obs，shape [H,W,Z]
-            t_star:    'auto' 或具体整数（0..T-1）
-            t_candidates: 自动匹配用的候选步（list[int]）
-            """
-            self.load_model(trained_model_filename)
-            device = self.device
-            self.ema.ema_model.eval()
-
-            # 取扩散常数
-            sqrt_acp   = self.ema.ema_model.sqrt_alphas_cumprod
-            sqrt_omacp = self.ema.ema_model.sqrt_one_minus_alphas_cumprod
-            T = sqrt_acp.shape[0]
-
-            if t_candidates is None:
-                t_candidates = list(range(50, T, 50)) + [T-1]
-
-            def _estimate_t_star(yb, xo):
-                best = (1e9, 0)
-                yb_t = torch.from_numpy(yb).float().to(device).unsqueeze(0).unsqueeze(0)
-                xo_t = torch.from_numpy(xo).float().to(device).unsqueeze(0).unsqueeze(0)
-                for t in t_candidates:
-                    a = sqrt_acp[t].item()
-                    b = sqrt_omacp[t].item()
-                    eps = (xo_t - a * yb_t) / (b + 1e-8)
-                    m = eps.mean().abs().item()
-                    s = eps.std().abs().item()
-                    score = m + abs(s - 1.)
-                    if score < best[0]:
-                        best = (score, t)
-                return best[1]
-
-            H, W, Z = xobs_img.shape
-            out = np.zeros_like(xobs_img, dtype=np.float32)
-
-            for z in range(Z):
-                yb = ybar_img[:, :, z]
-                xo = xobs_img[:, :, z]
-
-                if isinstance(t_star, str) and t_star == 'auto':
-                    t_opt = _estimate_t_star(yb, xo)
-                else:
-                    t_opt = int(t_star)
-
-                xo_t = torch.from_numpy(xo).float().to(device).unsqueeze(0).unsqueeze(0)
-                yb_t = torch.from_numpy(yb).float().to(device).unsqueeze(0).unsqueeze(0)
-                cond = torch.cat([yb_t, xo_t], dim=1)  # 约定 condition = [ȳ, x_obs]
-
-                tvec = torch.full((1,), t_opt, dtype=torch.long, device=device)
-
-                # 预测 eps_hat
-                eps_hat = self.ema.ema_model.model(xo_t, tvec, cond)
-
-                a = sqrt_acp[t_opt].to(eps_hat.device).view(1,1,1,1)
-                b = sqrt_omacp[t_opt].to(eps_hat.device).view(1,1,1,1)
-
-                x0_hat = (xo_t - b * eps_hat) / (a + 1e-8)
-
-                out[:, :, z] = x0_hat.squeeze().detach().cpu().numpy().astype(np.float32)
-
-            out = Data_processing.crop_or_pad(out, [H, W, Z], value=np.min(xobs_img))
-            out = Data_processing.normalize_image(out, normalize_factor=self.normalize_factor,
-                                                image_max=self.maximum_cutoff, image_min=self.background_cutoff,
-                                                invert=True)
-            if self.histogram_equalization:
-                out = Data_processing.apply_transfer_to_img(out, self.bins, self.bins_mapped, reverse=True)
-            out = Data_processing.correct_shift_caused_in_pad_crop_loop(out)
-            return out
