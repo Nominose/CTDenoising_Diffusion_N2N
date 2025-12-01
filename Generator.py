@@ -89,7 +89,7 @@ class Dataset_2D(Dataset):
         self.shuffle = shuffle
         self.augment = augment
         self.augment_frequency = augment_frequency
-        self.num_files = len(img_list)
+        self.num_files = len(self.y_bar_list)
 
         self.index_array = self.generate_index_array()
         self.current_y_bar_file = None
@@ -156,17 +156,17 @@ class Dataset_2D(Dataset):
         # print('condition file is: ', condition_file, ' while current condition file is: ', self.current_condition_file)
 
         
-        if x0_filename != self.current_x0_file:
-            x0_img = self.load_file(x0_filename)
+        if y_bar_filename != self.current_y_bar_file:
+            y_bar_img = self.load_file(y_bar_filename)
             # print('load: ',x0_filename)
-            self.current_x0_file = x0_filename
-            self.current_x0_data = np.copy(x0_img)
+            self.current_y_bar_file = y_bar_filename
+            self.current_y_bar_data = np.copy(y_bar_img)
 
-        if condition_file != self.current_condition_file:
+        if original_x_filename != self.current_original_x_file:
             # print('it is a new case, load the file')
-            condition_img = self.load_file(condition_file)
-            self.current_condition_file = condition_file
-            self.current_condition_data = np.copy(condition_img)
+            original_x_img = self.load_file(original_x_filename)
+            self.current_original_x_file = original_x_filename
+            self.current_original_x_data = np.copy(original_x_img)
 
             # define a list of random slice numbers
             if self.slice_range == None:
@@ -190,17 +190,23 @@ class Dataset_2D(Dataset):
             random_origin_x, random_origin_y = random.randint(0, x_shape - self.patch_size[0]), random.randint(0, y_shape - self.patch_size[1])
             # print('x range is: ', random_origin_x, random_origin_x + self.patch_size[0], ' and y range is: ', random_origin_y, random_origin_y + self.patch_size[1])
 
-        # target image
-        x0_image_data = np.copy(self.current_x0_data)[:,:,s] 
+        # target y_bar
+        x0_image_data = np.copy(self.current_y_bar_data)[:,:,s] 
         # crop the patch
         if self.num_patches_per_slice != None:
-            x0_image_data = x0_image_data[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
+            x0_image_data = x0_image_data[
+                random_origin_x : random_origin_x + self.patch_size[0],
+                random_origin_y : random_origin_y + self.patch_size[1],
+            ]
         
-        # condition image
+        # condition original_x
       
-        condition_image_data = np.copy(self.current_condition_data)[:,:,s]
+        condition_image_data = np.copy(self.current_original_x_data)[:,:,s]
         if self.num_patches_per_slice != None:
-                condition_image_data = condition_image_data[random_origin_x:random_origin_x + self.patch_size[0], random_origin_y:random_origin_y + self.patch_size[1]]
+                condition_image_data = condition_image_data[
+                random_origin_x : random_origin_x + self.patch_size[0],
+                random_origin_y : random_origin_y + self.patch_size[1],
+            ]
         # elif self.supervision == 'unsupervised':
         #     condition_image_data1 = np.copy(self.current_condition_data)[:,:,s-1]
         #     condition_image_data2 = np.copy(self.current_condition_data)[:,:,s+1]
