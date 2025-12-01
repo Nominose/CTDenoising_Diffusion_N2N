@@ -1279,10 +1279,10 @@ class Trainer(object):
 
                     # save the model
                     if self.step !=0 and divisible_by(self.step, self.save_model_every):
-                    print('i am saving model at step: ', self.step)
-                    self.save(self.step)
-                    print('model saved')
-                    # update the parameter
+                        print('i am saving model at step: ', self.step)
+                        self.save(self.step)
+                        print('model saved')
+                        # update the parameter
                     if self.step !=0 and divisible_by(self.step, self.train_lr_decay_every):
                         print('i am updating learning rate at step: ', self.step)
                         self.scheduler.step()
@@ -1345,7 +1345,7 @@ class Trainer(object):
                     self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
                     pbar.update(1)
 
-                accelerator.print('training complete')
+            accelerator.print('training complete')
 
 
 # Sampling class
