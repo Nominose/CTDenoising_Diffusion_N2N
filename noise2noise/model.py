@@ -870,7 +870,7 @@ class Sampler(object):
 
         idx = 0
         for batch in self.dl:
-            # 你的 Dataset_2D 返回 (input, output) = (相邻两张, 中心 noisy)
+            # Dataset_2D 返回 (input, output) = (相邻两张, 中心 noisy)
             batch_input, batch_gt = batch      # <--- 直接解包
             x_noisy = batch_gt.to(device)      # (B,1,H,W) 作为 x
             y_bar  = self.ema.ema_model(batch_input.to(device))  # (B,1,H,W)
