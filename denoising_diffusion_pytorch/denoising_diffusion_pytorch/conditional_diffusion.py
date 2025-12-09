@@ -856,31 +856,6 @@ class GaussianDiffusion(nn.Module):
             x_start = self.predict_start_from_v(x, t, v)
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
-        elif self.objective == 'forward_recon':
-            # 训练时：输入 x_start 当作观测 x_obs；条件也传 x_obs
-            # 目标是反解出来的 “真实 eps*”： eps* = (x_obs - sqrt(alpha_bar_t)*ȳ) / sqrt(1 - alpha_bar_t)
-            # 这里简化为：把 ȳ 也放在 condition 里（训练数据生成器要把 ȳ 拼到 condition 通道）
-            if not self.conditional_diffusion or (condition is None):
-                raise ValueError('forward_recon 需要 conditional_diffusion 且提供 condition')
-
-            # 用当前 t 反解 eps*：这里的 x = q_sample(x_start, t, noise) 已经是 x_t，
-            # 但 forward_recon 目标是用观测 x_obs 直接反解，因此改用 “输入张量本身” 作为 x_obs
-            x_obs = x_start
-
-            # 把 condition 的第一个通道当作 ȳ（你数据集里按这个约定）
-            y_bar = condition[:, :1, ...]
-            a = extract(self.sqrt_alphas_cumprod, t, x_obs.shape)
-            b = extract(self.sqrt_one_minus_alphas_cumprod, t, x_obs.shape)
-
-            target = (x_obs - a * y_bar) / (b + 1e-8)
-
-            # 模型前向用 x_obs 和 condition
-            model_out = self.model(x_obs, t, condition)
-            # 后面一样做 MSE 与加权
-            loss = F.mse_loss(model_out, target, reduction='none')
-            loss = reduce(loss, 'b ... -> b (...)', 'mean')
-            loss = loss * extract(self.loss_weight, t, loss.shape)
-            return loss.mean(), model_out, target
 
 
         return ModelPrediction(pred_noise, x_start)  # if prediction = ModelPrediction(pred_noise = a, x_start = b), then prediction.pred_noise = a, prediction.x_start = b
