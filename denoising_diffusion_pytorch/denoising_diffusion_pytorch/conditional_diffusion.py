@@ -662,7 +662,7 @@ class GaussianDiffusion(nn.Module):
         image_size, 
         timesteps = 2000,
         sampling_timesteps = None,
-        objective = 'pred_noise',  # previous definition is "pred_v"
+        objective = 'pred_x0',  # previous definition is "pred_v"
         clip_or_not = None,
         clip_range = None,
 
@@ -982,8 +982,49 @@ class GaussianDiffusion(nn.Module):
             return sample_fn((batch_size, self.channels, self.image_size[0], self.image_size[1], self.image_size[2]), condition = condition)
         else:
             raise ValueError(f'unknown problem dimension {self.problem_dimension}')
-      
+
     @torch.inference_mode()
+    def ddm2_denoise(self, noisy_image, condition=None, start_t=500, num_steps=50):
+        """
+        DDM² 去噪采样：从噪声图像开始，逐步去噪
+        
+        Args:
+            noisy_image: 噪声图像 [B, C, H, W]
+            condition: 条件（通常是噪声图像本身）
+            start_t: 起始时间步（通过 State Matching 估计，或使用默认值）
+            num_steps: 采样步数
+        """
+        device = noisy_image.device
+        batch_size = noisy_image.shape[0]
+        
+        img = noisy_image.clone()
+        
+        # 从 start_t 逐步采样到 t=0
+        timesteps = torch.linspace(start_t, 0, num_steps + 1).long().tolist()
+        
+        for i in tqdm(range(len(timesteps) - 1), desc='DDM² denoising'):
+            t = timesteps[i]
+            t_next = timesteps[i + 1]
+            
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # 模型预测 x0
+            pred_x0 = self.model(img, t_tensor, condition=condition)
+            
+            if self.clip_or_not:
+                pred_x0 = torch.clamp(pred_x0, self.clip_range[0], self.clip_range[1])
+            
+            if t_next > 0:
+                # 计算下一步的 noisy image
+                alpha_next = self.alphas_cumprod[t_next]
+                noise = torch.randn_like(img)
+                img = pred_x0 * alpha_next.sqrt() + noise * (1 - alpha_next).sqrt()
+            else:
+                img = pred_x0
+        
+        return self.unnormalize(img)  
+      
+    # @torch.inference_mode()
     # def interpolate(self, x1, x2, t = None, lam = 0.5):
     #     b, *_, device = *x1.shape, x1.device
     #     t = default(t, self.num_timesteps - 1)
@@ -1003,7 +1044,7 @@ class GaussianDiffusion(nn.Module):
 
     #     return img
 
-    @autocast(enabled = False)
+    # @autocast(enabled = False)
     # def q_sample(self, x_start, t, noise = None):
     #     '''prepare random xt from x_start and t'''
     #     noise = default(noise, lambda: torch.randn_like(x_start))
@@ -1013,38 +1054,54 @@ class GaussianDiffusion(nn.Module):
     #         extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
     #     )
 
-    def q_sample_new(self, x_start, t,lambda1, noise):
-        '''prepare random xt from x_start and t'''
-
-        return (
-            lambda1 * x_start + noise
-        )
-
 
     def p_losses(self, y_bar, original_X, t):
-        x_start = y_bar
-        eps_bar = original_X - y_bar
-        condition = original_X         
+        """
+        DDM² Stage III: Diffusion Model Training
+        - Noise shuffle: 使用空间打乱的噪声
+        - J-Invariance: 预测目标是原始噪声输入 x
+        """
+        eps_bar = original_X - y_bar  # Stage I 估计的残差噪声
+        condition = original_X
 
-        B = eps_bar.size(0)
-        idx = torch.randperm(B, device=eps_bar.device)
-        eps_mean = eps_bar[idx]  
+        # === Equation 4: 均值校正 ===
+        if self.problem_dimension == '2D':
+            mu_eps = eps_bar.mean(dim=(2, 3), keepdim=True)
+        else:  # 3D
+            mu_eps = eps_bar.mean(dim=(2, 3, 4), keepdim=True)
+        
+        eps_bar_centered = eps_bar - mu_eps  # 零均值化
+        
+        # 提取扩散系数
+        lambda1 = extract(self.sqrt_alphas_cumprod, t, y_bar.shape)
+        lambda2 = extract(self.sqrt_one_minus_alphas_cumprod, t, y_bar.shape)
+        
+        # 校正 y_bar (Equation 4)
+        y_bar_corrected = y_bar + (lambda2 * mu_eps) / lambda1
 
-        eps_bar = eps_bar - eps_mean             
+        # === Noise Shuffle: 空间维度打乱 ===
+        shape = eps_bar_centered.shape
+        B, C = shape[0], shape[1]
+        spatial_size = eps_bar_centered[0, 0].numel()  # H*W 或 H*W*D
+        
+        eps_flat = eps_bar_centered.view(B, C, spatial_size)
+        
+        # 对每个 batch 的每个 channel 独立打乱
+        idx = torch.argsort(torch.rand_like(eps_flat), dim=-1)
+        shuffled_eps = torch.gather(eps_flat, dim=-1, index=idx)
+        shuffled_eps = shuffled_eps.view(shape)
 
-        # calcualte lambda 1 and 2
-        lambda1 = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        lambda2 = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        # === 生成 S_t ===
+        # 论文: q(S_t|ȳ) = √ᾱ_t · ȳ + shuffle(ε̄)
+        S_t = lambda1 * y_bar_corrected + shuffled_eps
 
-        # y bar
-        y_bar = (y_bar + lambda1) / lambda2
-
-        # 用统一的 q_sample 来生成 S_t
-        S_t = self.q_sample_new(x_start=y_bar, t=t, lambda1 = lambda1, noise = eps_bar)
-
-        model_out = self.model(S_t, t, condition=condition)  # Unet(S_t, t)
+        # === 模型预测 ===
+        model_out = self.model(S_t, t, condition=condition)
+        
+        # === J-Invariance: 目标是原始噪声输入 x ===
         target = original_X
 
+        # === 损失计算 ===
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss * extract(self.loss_weight, t, loss.shape)
@@ -1205,7 +1262,7 @@ class Trainer(object):
                     print('training epoch: ', self.step + 1)
                     print('learning rate: ', self.scheduler.get_last_lr()[0])
 
-                    average_loss = []; average_diffusion_loss = []; average_bias_loss = []
+                    average_loss = []; average_diffusion_loss = []; average_bias_loss = 0.0
                     count = 0
                     for batch in self.dl:
                         if count == 0 or count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
@@ -1378,39 +1435,45 @@ class Sampler(object):
         self.ema.load_state_dict(data["ema"])
 
 
-    def sample_2D(self, trained_model_filename, condition_img):
+    def sample_2D(self, trained_model_filename, condition_img, start_t=500, num_steps=50):
         
-        background_cutoff = self.background_cutoff; maximum_cutoff = self.maximum_cutoff; normalize_factor = self.normalize_factor
+        background_cutoff = self.background_cutoff
+        maximum_cutoff = self.maximum_cutoff
         self.load_model(trained_model_filename) 
         
         device = self.device
-
         self.ema.ema_model.eval()
-        # check whether model is on GPU:
-        print('model device: ', next(self.ema.ema_model.parameters()).device)
+        
+        pred_img = np.zeros((self.image_size[0], self.image_size[1], condition_img.shape[-1]), dtype=np.float32)
 
-        pred_img = np.zeros((self.image_size[0], self.image_size[1], condition_img.shape[-1]), dtype = np.float32)
-
-        # start to run
         with torch.inference_mode():
-            
-            for z_slice in range(0,condition_img.shape[-1]):
+            for z_slice in range(0, condition_img.shape[-1]):
                 datas = next(self.cycle_dl)
                 data_condition = datas[1]
-                    
-                data_condition = data_condition.to(device)  if self.conditional_diffusion else None 
-                            
-                pred_img_slice = self.ema.ema_model.sample(condition = data_condition, batch_size = self.batch_size)
+                data_condition = data_condition.to(device) if self.conditional_diffusion else None 
+                
+                pred_img_slice = self.ema.ema_model.ddm2_denoise(
+                    noisy_image=data_condition,
+                    condition=data_condition,
+                    start_t=start_t,
+                    num_steps=num_steps
+                )
+                
                 pred_img_slice = pred_img_slice.detach().cpu().numpy().squeeze()
-                print('pred_img_slice shape: ', pred_img_slice.shape)
                 pred_img[:,:,z_slice] = pred_img_slice
 
+        # 尺寸调整
+        pred_img = Data_processing.crop_or_pad(
+            pred_img, 
+            [condition_img.shape[0], condition_img.shape[1], condition_img.shape[-1]], 
+            value=np.min(pred_img)
+        )
         
-        pred_img = Data_processing.crop_or_pad(pred_img, [condition_img.shape[0], condition_img.shape[1],condition_img.shape[-1]], value = np.min(condition_img))
-        pred_img = Data_processing.normalize_image(pred_img, normalize_factor = normalize_factor, image_max = maximum_cutoff, image_min = background_cutoff, invert = True)
+        # 反归一化
+        pred_img = (pred_img + 1) / 2 * (maximum_cutoff - background_cutoff) + background_cutoff
+        
         if self.histogram_equalization:
-            pred_img = Data_processing.apply_transfer_to_img(pred_img, self.bins, self.bins_mapped,reverse = True)
-        pred_img = Data_processing.correct_shift_caused_in_pad_crop_loop(pred_img)
-        print('final image shape: ', pred_img.shape)
-      
+            pred_img = Data_processing.apply_transfer_to_img(pred_img, self.bins, self.bins_mapped, reverse=True)
+        
+        print(f'final image range: [{pred_img.min():.1f}, {pred_img.max():.1f}]')
         return pred_img
