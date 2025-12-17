@@ -654,6 +654,21 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+def reverse_warmup_beta_schedule(timesteps, beta_start=5e-5, beta_end=1e-2, warmup_frac=0.7):
+    """
+    DDM² reverse warm-up schedule
+    
+    - 前 (1-warmup_frac)*timesteps 步：β 保持在 beta_start
+    - 后 warmup_frac*timesteps 步：β 从 beta_start 线性增加到 beta_end
+    """
+    betas = torch.full((timesteps,), beta_start, dtype=torch.float64)
+    warmup_time = int(timesteps * warmup_frac)
+    betas[timesteps - warmup_time:] = torch.linspace(
+        beta_start, beta_end, warmup_time, dtype=torch.float64
+    )
+    return betas
+
+
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -667,7 +682,7 @@ class GaussianDiffusion(nn.Module):
         clip_range = None,
 
         force_ddim = False,
-        beta_schedule = 'sigmoid',
+        beta_schedule = 'reverse_warmup',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
         auto_normalize = False,
@@ -703,6 +718,8 @@ class GaussianDiffusion(nn.Module):
             beta_schedule_fn = cosine_beta_schedule
         elif beta_schedule == 'sigmoid':
             beta_schedule_fn = sigmoid_beta_schedule
+        elif beta_schedule == 'reverse_warmup':  # ← 新增
+            beta_schedule_fn = reverse_warmup_beta_schedule
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
@@ -982,47 +999,123 @@ class GaussianDiffusion(nn.Module):
             return sample_fn((batch_size, self.channels, self.image_size[0], self.image_size[1], self.image_size[2]), condition = condition)
         else:
             raise ValueError(f'unknown problem dimension {self.problem_dimension}')
-
     @torch.inference_mode()
-    def ddm2_denoise(self, noisy_image, condition=None, start_t=500, num_steps=50):
+    def state_matching(self, noisy_image, y_bar, mode='mean'):
         """
-        DDM² 去噪采样：从噪声图像开始，逐步去噪
+        State Matching：根据残差噪声找到最佳起始时间步
+        
+        DDM² 论文的 √(Σβ) 对应标准 DDPM 的 √(1-ᾱ_t)
         
         Args:
-            noisy_image: 噪声图像 [B, C, H, W]
-            condition: 条件（通常是噪声图像本身）
-            start_t: 起始时间步（通过 State Matching 估计，或使用默认值）
-            num_steps: 采样步数
+            noisy_image: (B, C, H, W) 原始噪声图像，范围 [-1, 1]
+            y_bar: (B, C, H, W) Stage I (N2N) 输出，范围 [-1, 1]
+            mode: 'mean' = 平均 sigma, 'max' = 最大 sigma
+        
+        Returns:
+            t_star: 最佳起始时间步
+        """
+        batch_size = noisy_image.shape[0]
+        
+        # 1. 计算残差
+        residual = noisy_image - y_bar
+        
+        # 2. 去均值（论文 Eq.4 的均值校准）
+        residual = residual - residual.mean(dim=(1, 2, 3), keepdim=True)
+        
+        # 3. 计算每个样本的 sigma（unbiased=False 更符合总体统计）
+        sigmas = residual.view(batch_size, -1).std(dim=1, unbiased=False)
+        
+        # 4. 聚合 batch
+        if batch_size == 1:
+            sigma = sigmas[0].item()
+        elif mode == 'mean':
+            sigma = sigmas.mean().item()
+        elif mode == 'max':
+            sigma = sigmas.max().item()
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        
+        # 5. 【关键】用 √(1-ᾱ_t) 匹配，不是 √β_t
+        #    DDM² 论文的 √(Σβ) ≈ DDPM 的 √(1-ᾱ_t)
+        if hasattr(self, 'sqrt_one_minus_alphas_cumprod'):
+            noise_schedule = self.sqrt_one_minus_alphas_cumprod
+        else:
+            noise_schedule = torch.sqrt(1.0 - self.alphas_cumprod)
+        
+        noise_schedule = noise_schedule.to(noisy_image.device)
+        
+        # 6. 找到最接近的 t
+        t_star = torch.argmin(torch.abs(noise_schedule - sigma)).item()
+        
+        print(f"State Matching: σ={sigma:.4f} -> t*={t_star} (noise_level={noise_schedule[t_star]:.4f})")
+        
+        return t_star
+
+    @torch.inference_mode()
+    def ddm2_denoise(self, noisy_image, y_bar=None, start_t=None):
+        """
+        DDM² 去噪：从噪声图像开始反向采样
+        
+        Args:
+            noisy_image: (B, C, H, W) 原始噪声图像，范围 [-1, 1]
+            y_bar: (B, C, H, W) Stage I 输出，用于 State Matching
+            start_t: 手动指定起始 t（None = 自动 State Matching）
+        
+        Returns:
+            去噪后图像 (B, C, H, W)，范围 [0, 1]
         """
         device = noisy_image.device
         batch_size = noisy_image.shape[0]
         
+        # State Matching
+        if start_t is None:
+            if y_bar is None:
+                raise ValueError("需要提供 y_bar 进行 State Matching，或手动指定 start_t")
+            start_t = self.state_matching(noisy_image, y_bar)
+        
+        start_t = min(start_t, self.num_timesteps - 1)
+        
+        # 从原始噪声图像开始（不是 y_bar！）
         img = noisy_image.clone()
         
-        # 从 start_t 逐步采样到 t=0
-        timesteps = torch.linspace(start_t, 0, num_steps + 1).long().tolist()
-        
-        for i in tqdm(range(len(timesteps) - 1), desc='DDM² denoising'):
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
+        # 反向采样
+        for t in tqdm(reversed(range(0, start_t + 1)), desc='DDM² denoising', total=start_t + 1, leave=False):
+            batched_times = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            # 模型预测
+            model_output = self.model(img, batched_times, None)
             
-            # 模型预测 x0
-            pred_x0 = self.model(img, t_tensor, condition=condition)
-            
-            if self.clip_or_not:
-                pred_x0 = torch.clamp(pred_x0, self.clip_range[0], self.clip_range[1])
-            
-            if t_next > 0:
-                # 计算下一步的 noisy image
-                alpha_next = self.alphas_cumprod[t_next]
-                noise = torch.randn_like(img)
-                img = pred_x0 * alpha_next.sqrt() + noise * (1 - alpha_next).sqrt()
+            # 根据 objective 计算 x_start
+            if self.objective == 'pred_noise':
+                pred_noise = model_output
+                x_start = self.predict_start_from_noise(img, batched_times, pred_noise)
+            elif self.objective == 'pred_x0':
+                x_start = model_output
+            elif self.objective == 'pred_v':
+                v = model_output
+                x_start = self.predict_start_from_v(img, batched_times, v)
             else:
-                img = pred_x0
+                raise ValueError(f'unknown objective {self.objective}')
+            
+            # Clip（修复：正确处理 clip_range）
+            if self.clip_or_not:
+                if isinstance(self.clip_range, (list, tuple)):
+                    x_start.clamp_(self.clip_range[0], self.clip_range[1])
+                else:
+                    x_start.clamp_(-self.clip_range, self.clip_range)
+            
+            # 计算后验均值和方差
+            model_mean, _, model_log_variance = self.q_posterior(x_start=x_start, x_t=img, t=batched_times)
+            
+            # 采样（t=0 时不加噪声）
+            noise = torch.randn_like(img) if t > 0 else 0.
+            img = model_mean + (0.5 * model_log_variance).exp() * noise
         
-        return self.unnormalize(img)  
+        # Unnormalize: [-1, 1] -> [0, 1]
+        img = (img + 1) / 2
+        img = img.clamp(0, 1)
+        
+        return img
       
     # @torch.inference_mode()
     # def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -1057,51 +1150,42 @@ class GaussianDiffusion(nn.Module):
 
     def p_losses(self, y_bar, original_X, t):
         """
-        DDM² Stage III: Diffusion Model Training
-        - Noise shuffle: 使用空间打乱的噪声
-        - J-Invariance: 预测目标是原始噪声输入 x
+        DDM² Stage III: 无 condition 版本
         """
-        eps_bar = original_X - y_bar  # Stage I 估计的残差噪声
-        condition = original_X
+        eps_bar = original_X - y_bar
 
-        # === Equation 4: 均值校正 ===
+        # Equation 4: 均值校正
         if self.problem_dimension == '2D':
             mu_eps = eps_bar.mean(dim=(2, 3), keepdim=True)
-        else:  # 3D
+        else:
             mu_eps = eps_bar.mean(dim=(2, 3, 4), keepdim=True)
         
-        eps_bar_centered = eps_bar - mu_eps  # 零均值化
+        eps_bar_centered = eps_bar - mu_eps
         
-        # 提取扩散系数
         lambda1 = extract(self.sqrt_alphas_cumprod, t, y_bar.shape)
         lambda2 = extract(self.sqrt_one_minus_alphas_cumprod, t, y_bar.shape)
         
-        # 校正 y_bar (Equation 4)
         y_bar_corrected = y_bar + (lambda2 * mu_eps) / lambda1
 
-        # === Noise Shuffle: 空间维度打乱 ===
+        # Noise Shuffle
         shape = eps_bar_centered.shape
         B, C = shape[0], shape[1]
-        spatial_size = eps_bar_centered[0, 0].numel()  # H*W 或 H*W*D
+        spatial_size = eps_bar_centered[0, 0].numel()
         
         eps_flat = eps_bar_centered.view(B, C, spatial_size)
-        
-        # 对每个 batch 的每个 channel 独立打乱
         idx = torch.argsort(torch.rand_like(eps_flat), dim=-1)
         shuffled_eps = torch.gather(eps_flat, dim=-1, index=idx)
         shuffled_eps = shuffled_eps.view(shape)
 
-        # === 生成 S_t ===
-        # 论文: q(S_t|ȳ) = √ᾱ_t · ȳ + shuffle(ε̄)
+        # 生成 S_t
         S_t = lambda1 * y_bar_corrected + shuffled_eps
 
-        # === 模型预测 ===
-        model_out = self.model(S_t, t, condition=condition)
+        # ====== 关键：没有 condition ======
+        model_out = self.model(S_t, t)  # 只有 S_t 和 t
         
-        # === J-Invariance: 目标是原始噪声输入 x ===
+        # J-Invariance: target 是 x
         target = original_X
 
-        # === 损失计算 ===
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss * extract(self.loss_weight, t, loss.shape)
@@ -1119,7 +1203,7 @@ class GaussianDiffusion(nn.Module):
             b, c, h, w, d = original_X.shape
             device = original_X.device
 
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        t = torch.randint(1, self.num_timesteps, (b,), device=device).long()
 
         loss, model_out, target = self.p_losses(y_bar, original_X, t)
         return loss, model_out, target
@@ -1435,8 +1519,10 @@ class Sampler(object):
         self.ema.load_state_dict(data["ema"])
 
 
-    def sample_2D(self, trained_model_filename, condition_img, start_t=500, num_steps=50):
-        
+    def sample_2D(self, trained_model_filename, condition_img, start_t=None, batch_size=1):
+        """
+        DDM² 2D 采样
+        """
         background_cutoff = self.background_cutoff
         maximum_cutoff = self.maximum_cutoff
         self.load_model(trained_model_filename) 
@@ -1444,36 +1530,77 @@ class Sampler(object):
         device = self.device
         self.ema.ema_model.eval()
         
-        pred_img = np.zeros((self.image_size[0], self.image_size[1], condition_img.shape[-1]), dtype=np.float32)
+        num_slices = condition_img.shape[-1]
+        pred_img = np.zeros((self.image_size[0], self.image_size[1], num_slices), dtype=np.float32)
 
+        dataset = self.dl.dataset
+        
+        # 安全检查
+        if len(dataset) != num_slices:
+            raise ValueError(
+                f"Dataset length ({len(dataset)}) != Volume slices ({num_slices}). "
+                f"请确保 DataLoader 只包含当前病人的数据！"
+            )
+        
         with torch.inference_mode():
-            for z_slice in range(0, condition_img.shape[-1]):
-                datas = next(self.cycle_dl)
-                data_condition = datas[1]
-                data_condition = data_condition.to(device) if self.conditional_diffusion else None 
+            for batch_start in tqdm(range(0, num_slices, batch_size), desc="DDM² Sampling"):
+                batch_end = min(batch_start + batch_size, num_slices)
                 
-                pred_img_slice = self.ema.ema_model.ddm2_denoise(
-                    noisy_image=data_condition,
-                    condition=data_condition,
-                    start_t=start_t,
-                    num_steps=num_steps
+                # 收集 batch 数据
+                y_bar_list = []
+                x_orig_list = []
+                
+                for idx in range(batch_start, batch_end):
+                    data = dataset[idx]
+                    y_bar_list.append(data[0])
+                    x_orig_list.append(data[1])
+                
+                y_bar = torch.stack(y_bar_list, dim=0).to(device)
+                x_orig = torch.stack(x_orig_list, dim=0).to(device)
+                
+                # 调试：检查输入范围
+                if batch_start == 0:
+                    print(f"DEBUG - x_orig range: [{x_orig.min():.4f}, {x_orig.max():.4f}]")
+                    print(f"DEBUG - y_bar range: [{y_bar.min():.4f}, {y_bar.max():.4f}]")
+                
+                # 【关键】范围检查：如果是 [0,1]，转换为 [-1,1]
+                if x_orig.min() >= -0.01 and x_orig.max() <= 1.01:
+                    if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
+                        if batch_start == 0:
+                            print("DEBUG: Detecting [0, 1] input, converting to [-1, 1]...")
+                        x_orig = x_orig * 2.0 - 1.0
+                        y_bar = y_bar * 2.0 - 1.0
+                
+                # DDM² 去噪
+                pred_batch = self.ema.ema_model.ddm2_denoise(
+                    noisy_image=x_orig,
+                    y_bar=y_bar,
+                    start_t=start_t
                 )
                 
-                pred_img_slice = pred_img_slice.detach().cpu().numpy().squeeze()
-                pred_img[:,:,z_slice] = pred_img_slice
+                if batch_start == 0:
+                    print(f"DEBUG - output range: [{pred_batch.min():.4f}, {pred_batch.max():.4f}]")
+                
+                # 存储
+                pred_batch_np = pred_batch.detach().cpu().numpy()
+                for i, slice_idx in enumerate(range(batch_start, batch_end)):
+                    pred_img[:, :, slice_idx] = pred_batch_np[i, 0, :, :]
 
-        # 尺寸调整
+        # 后处理
         pred_img = Data_processing.crop_or_pad(
             pred_img, 
             [condition_img.shape[0], condition_img.shape[1], condition_img.shape[-1]], 
             value=np.min(pred_img)
         )
         
-        # 反归一化
-        pred_img = (pred_img + 1) / 2 * (maximum_cutoff - background_cutoff) + background_cutoff
+        print(f"DEBUG - Before clip: [{pred_img.min():.4f}, {pred_img.max():.4f}]")
+        pred_img = np.clip(pred_img, 0, 1)
+        pred_img = pred_img * (maximum_cutoff - background_cutoff) + background_cutoff
         
         if self.histogram_equalization:
-            pred_img = Data_processing.apply_transfer_to_img(pred_img, self.bins, self.bins_mapped, reverse=True)
+            pred_img = Data_processing.apply_transfer_to_img(
+                pred_img, self.bins, self.bins_mapped, reverse=True
+            )
         
-        print(f'final image range: [{pred_img.min():.1f}, {pred_img.max():.1f}]')
+        print(f'Final image range: [{pred_img.min():.1f}, {pred_img.max():.1f}]')
         return pred_img
