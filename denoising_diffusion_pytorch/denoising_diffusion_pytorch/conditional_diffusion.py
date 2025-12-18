@@ -758,6 +758,9 @@ class GaussianDiffusion(nn.Module):
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))  # this is sqrt(1- alpha(t)-bar)  /  sqrt(alpha(t)-bar) in the note
 
+        sqrt_alphas_cumprod_prev = torch.sqrt(torch.cat([torch.tensor([1.0]), alphas_cumprod]))
+        register_buffer('sqrt_alphas_cumprod_prev', sqrt_alphas_cumprod_prev)
+
         # calculations for posterior q(x_{t-1} | x_t, x_0)
 
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod) # use option 2 in my note
@@ -801,11 +804,6 @@ class GaussianDiffusion(nn.Module):
 
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
-
-        # ==================== 【新增】DDM² State Matching 相关 ====================
-        self.matched_state_t = None
-        self.fixed_sqrt_alpha = None           # √ᾱ_{t*}
-        self.fixed_sqrt_one_minus_alpha = None # √(1-ᾱ_{t*})
 
     @property
     # @property is a built-in Python decorator that allows you to define a method as if it were a class attribute. This means you can access it like an attribute rather than calling it as a method.
@@ -1005,60 +1003,56 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown problem dimension {self.problem_dimension}')
 
-    def set_matched_state(self, t_star):
-            """
-            设置 State Matching 得到的 t*
-            在训练开始前调用一次
-            """
-            self.matched_state_t = t_star
-            self.fixed_sqrt_alpha = self.sqrt_alphas_cumprod[t_star]
-            self.fixed_sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t_star]
-            print(f"Set matched state: t*={t_star}, √ᾱ_t*={self.fixed_sqrt_alpha:.4f}, √(1-ᾱ_t*)={self.fixed_sqrt_one_minus_alpha:.4f}")
+    @torch.inference_mode()
+    def compute_matched_state(self, original_X, y_bar):
+        """
+        计算 per-sample 的 matched_state（和论文索引一致）
+        """
+        B = original_X.shape[0]
+        device = original_X.device
+        
+        # 计算残差
+        residual = original_X - y_bar
+        residual = residual - residual.mean(dim=tuple(range(1, residual.ndim)), keepdim=True)
+        
+        # 计算每个样本的 sigma
+        sigmas = residual.flatten(1).std(dim=1, unbiased=False)  # (B,)
+        
+        # 【关键】使用论文的索引体系：sqrt(1 - alpha_prev^2)
+        # sqrt_alphas_cumprod_prev 长度 T+1，索引 0..T
+        schedule = (1 - self.sqrt_alphas_cumprod_prev**2).sqrt().to(device)  # (T+1,)
+        
+        # 匹配
+        t_star = (schedule[None, :] - sigmas[:, None]).abs().argmin(dim=1)  # (B,)
+        
+        # 防止 t_star=0（会导致除以0）
+        t_star = t_star.clamp(min=1, max=self.num_timesteps - 1)
+        
+        return t_star.long()
 
     @torch.inference_mode()
-    def state_matching(self, noisy_image, y_bar, mode='mean'):
+    def state_matching(self, original_X, y_bar):
         """
-        State Matching：根据残差噪声找到最佳起始时间步
+        推理时的 State Matching（返回单个 t*，取 batch 最大值）
         """
-        batch_size = noisy_image.shape[0]
+        matched_state = self.compute_matched_state(original_X, y_bar)
+        t_star = int(matched_state[0].item())
         
-        # 1. 计算残差
-        residual = noisy_image - y_bar
-        
-        # 2. 去均值（兼容 2D/3D）
-        if len(residual.shape) == 4:  # 2D: (B, C, H, W)
-            residual = residual - residual.mean(dim=(2, 3), keepdim=True)
-        else:  # 3D: (B, C, H, W, D)
-            residual = residual - residual.mean(dim=(2, 3, 4), keepdim=True)
-        
-        # 3. 计算每个样本的 sigma
-        sigmas = residual.view(batch_size, -1).std(dim=1, unbiased=False)
-        
-        # 4. 聚合 batch
-        if mode == 'mean':
-            sigma = sigmas.mean().item()
-        elif mode == 'max':
-            sigma = sigmas.max().item()
-        else:
-            sigma = sigmas[0].item()
-        
-        # 5. 用 √(1-ᾱ_t) 匹配
-        noise_schedule = self.sqrt_one_minus_alphas_cumprod.to(noisy_image.device)
-        
-        # 6. 找到最接近的 t
-        t_star = torch.argmin(torch.abs(noise_schedule - sigma)).item()
-        
-        print(f"State Matching: σ={sigma:.4f} -> t*={t_star} (√(1-ᾱ_t*)={noise_schedule[t_star]:.4f})")
-        
+        print(f"State Matching: t* = {t_star}")
         return t_star
 
     @torch.inference_mode()
-    def ddm2_denoise(self, noisy_image, y_bar=None, start_t=None, use_flip_aug=False):
+    def ddm2_denoise(self, noisy_image, y_bar=None, start_t=None, use_flip=True):
         """
-        DDM² 去噪：从噪声图像开始反向采样
+        DDM² 去噪
+        
+        Args:
+            noisy_image: 原始噪声图像
+            y_bar: N2N 输出（用于 State Matching）
+            start_t: 起始时间步（如果为 None，自动计算）
+            use_flip: 是否使用 flip augmentation
         """
         device = noisy_image.device
-        batch_size = noisy_image.shape[0]
         
         # State Matching
         if start_t is None:
@@ -1069,54 +1063,105 @@ class GaussianDiffusion(nn.Module):
         start_t = min(start_t, self.num_timesteps - 1)
         print(f"DDM² denoising from t={start_t}")
         
-        if use_flip_aug:
-            return self._denoise_with_flip_aug(noisy_image, start_t)
+        if use_flip:
+            return self._denoise_with_flip(noisy_image, start_t)
         else:
             return self._denoise_single(noisy_image, start_t)
 
     def _denoise_single(self, noisy_image, start_t):
-        """单次反向采样"""
+        """单次反向采样（使用现有的 p_sample）"""
         device = noisy_image.device
         batch_size = noisy_image.shape[0]
         img = noisy_image.clone()
         
-        for t in tqdm(reversed(range(0, start_t + 1)), desc='DDM² denoising', total=start_t + 1, leave=False):
-            batched_times = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
-            # 模型预测
-            model_output = self.model(img, batched_times, None)
-            
-            # 根据 objective 计算 x_start
-            if self.objective == 'pred_noise':
-                pred_noise = model_output
-                x_start = self.predict_start_from_noise(img, batched_times, pred_noise)
-            elif self.objective == 'pred_x0':
-                x_start = model_output
-            elif self.objective == 'pred_v':
-                v = model_output
-                x_start = self.predict_start_from_v(img, batched_times, v)
-            else:
-                raise ValueError(f'unknown objective {self.objective}')
-            
-            # Clip
-            if self.clip_or_not:
-                if isinstance(self.clip_range, (list, tuple)):
-                    x_start.clamp_(self.clip_range[0], self.clip_range[1])
-                else:
-                    x_start.clamp_(-self.clip_range, self.clip_range)
-            
-            # 计算后验均值和方差
-            model_mean, _, model_log_variance = self.q_posterior(x_start=x_start, x_t=img, t=batched_times)
-            
-            # 采样（t=0 时不加噪声）
-            noise = torch.randn_like(img) if t > 0 else 0.
-            img = model_mean + (0.5 * model_log_variance).exp() * noise
+        for t in tqdm(reversed(range(0, start_t)), desc='DDM² denoising', total=start_t + 1, leave=False):
+            # 使用现有的 p_sample
+            img, x_start = self.p_sample(img, t, condition=None, output_noise=False)
         
-        # Unnormalize: [-1, 1] -> [0, 1]
+        # [-1, 1] -> [0, 1]
         img = (img + 1) / 2
         img = img.clamp(0, 1)
         
         return img
+
+
+    def _denoise_with_flip(self, noisy_image, start_t):
+        """带 flip augmentation 的反向采样"""
+        device = noisy_image.device
+        batch_size = noisy_image.shape[0]
+        img = noisy_image.clone()
+        
+        for t in tqdm(reversed(range(0, start_t)), desc='DDM² denoising', total=start_t + 1, leave=False):
+            batched_times = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # flip denoise: 4次翻转平均（在预测 x_start 这一步做）
+            x_start = self._flip_predict(img, batched_times)
+            
+            # clip
+            if self.clip_or_not:
+                x_start.clamp_(self.clip_range[0], self.clip_range[1])
+            
+            # 使用现有的 q_posterior
+            model_mean, _, model_log_variance = self.q_posterior(x_start=x_start, x_t=img, t=batched_times)
+            
+            # 采样
+            noise = torch.randn_like(img) if t > 0 else 0.
+            img = model_mean + (0.5 * model_log_variance).exp() * noise
+        
+        # [-1, 1] -> [0, 1]
+        img = (img + 1) / 2
+        img = img.clamp(0, 1)
+        
+        return img
+
+    def _flip_predict(self, x, t):
+        """4次翻转平均预测 x_start"""
+        results = []
+        
+        # 原图
+        out = self.model(x, t)
+        if self.objective == 'pred_noise':
+            x_start = self.predict_start_from_noise(x, t, out)
+        elif self.objective == 'pred_x0':
+            x_start = out
+        elif self.objective == 'pred_v':
+            x_start = self.predict_start_from_v(x, t, out)
+        results.append(x_start)
+        
+        # 水平翻转
+        x_h = torch.flip(x, dims=[-1])
+        out_h = self.model(x_h, t)
+        if self.objective == 'pred_noise':
+            x_start_h = self.predict_start_from_noise(x_h, t, out_h)
+        elif self.objective == 'pred_x0':
+            x_start_h = out_h
+        elif self.objective == 'pred_v':
+            x_start_h = self.predict_start_from_v(x_h, t, out_h)
+        results.append(torch.flip(x_start_h, dims=[-1]))
+        
+        # 垂直翻转
+        x_v = torch.flip(x, dims=[-2])
+        out_v = self.model(x_v, t)
+        if self.objective == 'pred_noise':
+            x_start_v = self.predict_start_from_noise(x_v, t, out_v)
+        elif self.objective == 'pred_x0':
+            x_start_v = out_v
+        elif self.objective == 'pred_v':
+            x_start_v = self.predict_start_from_v(x_v, t, out_v)
+        results.append(torch.flip(x_start_v, dims=[-2]))
+        
+        # 双翻转
+        x_hv = torch.flip(x, dims=[-2, -1])
+        out_hv = self.model(x_hv, t)
+        if self.objective == 'pred_noise':
+            x_start_hv = self.predict_start_from_noise(x_hv, t, out_hv)
+        elif self.objective == 'pred_x0':
+            x_start_hv = out_hv
+        elif self.objective == 'pred_v':
+            x_start_hv = self.predict_start_from_v(x_hv, t, out_hv)
+        results.append(torch.flip(x_start_hv, dims=[-2, -1]))
+        
+        return torch.stack(results, dim=0).mean(dim=0)        
 
     def _denoise_with_flip_aug(self, noisy_image, start_t):
         """带 Flip Augmentation 的去噪（提升鲁棒性）"""
@@ -1143,87 +1188,88 @@ class GaussianDiffusion(nn.Module):
         # 平均
         return torch.stack(results, dim=0).mean(dim=0)
 
-    def p_losses(self, y_bar, original_X, t):
+    def p_losses(self, y_bar, original_X, t, matched_state):
         """
-        DDM² Stage III: 与源代码一致的实现
+        DDM² Stage III: 使用论文的索引体系
         """
-        # 检查是否已设置 matched_state_t
-        if self.fixed_sqrt_alpha is None:
-            raise ValueError("请先调用 set_matched_state(t_star) 设置 matched state!")
-        
         B = y_bar.shape[0]
         device = y_bar.device
         
-        # 获取 t* 对应的固定系数
-        fixed_sqrt_alpha = self.fixed_sqrt_alpha                      # √ᾱ_{t*}
-        fixed_sqrt_one_minus_alpha = self.fixed_sqrt_one_minus_alpha  # √(1-ᾱ_{t*})
-        
-        # ==================== 核心修复 ====================
-        
-        # 【修复1】用 t* 的系数计算残差，并归一化到标准高斯
-        eps_bar_raw = original_X - fixed_sqrt_alpha * y_bar
-        noise = eps_bar_raw / fixed_sqrt_one_minus_alpha  # 归一化
-        
-        # 【修复2】均值校正（Equation 4）
         if self.problem_dimension == '2D':
-            noise_mean = noise.mean(dim=(2, 3), keepdim=True)
+            _, C, H, W = y_bar.shape
         else:
-            noise_mean = noise.mean(dim=(2, 3, 4), keepdim=True)
+            _, C, H, W, D = y_bar.shape
         
-        noise_centered = noise - noise_mean
+        # 【关键】使用 sqrt_alphas_cumprod_prev（和论文一致）
+        fixed_alphas = self.sqrt_alphas_cumprod_prev[matched_state]  # (B,)
+        
+        # reshape
+        if self.problem_dimension == '2D':
+            fixed_alphas = fixed_alphas.view(B, 1, 1, 1)
+        else:
+            fixed_alphas = fixed_alphas.view(B, 1, 1, 1, 1)
+        
+        # 计算噪声（和论文一样的公式）
+        noise = (original_X - fixed_alphas * y_bar.detach()) / (1 - fixed_alphas**2).sqrt()
+        
+        # Eq 4: 均值校正
+        noise_mean = noise.mean(dim=tuple(range(1, noise.ndim)), keepdim=True)
+        noise = noise - noise_mean.detach()
         
         # 校正 y_bar
-        y_bar_corrected = y_bar + (fixed_sqrt_one_minus_alpha * noise_mean) / fixed_sqrt_alpha
+        y_bar_corrected = y_bar + noise_mean.detach() * (1 - fixed_alphas**2).sqrt() / fixed_alphas
         
-        # 【修复3】Noise Shuffle（每个样本独立打乱）
-        shape = noise_centered.shape
-        C = shape[1]
-        spatial_size = noise_centered[0, 0].numel()
-        noise_flat = noise_centered.view(B, C, spatial_size)
+        # Noise shuffle
+        if self.problem_dimension == '2D':
+            spatial_size = H * W
+            noise_flat = noise.view(B, C, -1)
+            rand_idx = torch.randperm(spatial_size, device=device)
+            noise_shuffled = noise_flat[:, :, rand_idx].view(B, C, H, W).detach()
+        else:
+            spatial_size = H * W * D
+            noise_flat = noise.view(B, C, -1)
+            rand_idx = torch.randperm(spatial_size, device=device)
+            noise_shuffled = noise_flat[:, :, rand_idx].view(B, C, H, W, D).detach()
         
-        idx = torch.argsort(torch.rand_like(noise_flat), dim=-1)
-        shuffled_noise = torch.gather(noise_flat, dim=-1, index=idx).view(shape)
-        shuffled_noise = shuffled_noise.detach()  # 阻断梯度
-        
-        # 【修复4】标准 q_sample 形式构造 S_t
+        # q_sample 构造 S_t
         sqrt_alpha_t = extract(self.sqrt_alphas_cumprod, t, y_bar.shape)
         sqrt_one_minus_alpha_t = extract(self.sqrt_one_minus_alphas_cumprod, t, y_bar.shape)
         
-        S_t = sqrt_alpha_t * y_bar_corrected + sqrt_one_minus_alpha_t * shuffled_noise
+        S_t = sqrt_alpha_t * y_bar_corrected + sqrt_one_minus_alpha_t * noise_shuffled
         
-        # ==================== 模型预测 ====================
-        
+        # 模型预测
         model_out = self.model(S_t, t)
         
-        # J-Invariance Loss: target 是原始噪声图像 x
+        # Loss
         target = original_X
-        
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss * extract(self.loss_weight, t, loss.shape)
         
         return loss.mean(), model_out, target
-
    
     
     def forward(self, y_bar, original_X, *args, **kwargs):
-            """
-            DDM² 前向传播
-            注意：需要在训练前调用 set_matched_state(t_star)
-            """
-            if self.problem_dimension == '2D':
-                b, c, h, w = original_X.shape
-            else:
-                b, c, h, w, d = original_X.shape
-            
-            device = original_X.device
-            
-            # 随机采样 t（从 1 开始，不是 0）
-            t = torch.randint(1, self.num_timesteps, (b,), device=device).long()
-            
-            loss, model_out, target = self.p_losses(y_bar, original_X, t)
-            return loss, model_out, target
-
+        """
+        DDM² 前向传播（per-sample matched_state）
+        """
+        if self.problem_dimension == '2D':
+            b, c, h, w = original_X.shape
+        else:
+            b, c, h, w, d = original_X.shape
+        
+        device = original_X.device
+        
+        # 计算 per-sample matched_state（向量化）
+        matched_state = self.compute_matched_state(original_X, y_bar)
+        
+        # 随机采样 t
+        t = torch.randint(1, self.num_timesteps, (b,), device=device).long()
+        
+        # 调用 p_losses
+        loss, model_out, target = self.p_losses(y_bar, original_X, t, matched_state)
+        
+        return loss, model_out, target
 
 # trainer class
 class Trainer(object):
@@ -1326,6 +1372,10 @@ class Trainer(object):
         device = accelerator.device
 
         data = torch.load(trained_model_filename, map_location=device)
+        
+        self.model.load_state_dict(model_state)
+        
+        self.step = data['step']
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -1352,38 +1402,6 @@ class Trainer(object):
             if start_step is not None:
                 self.step = start_step
             
-            # ==================== 【新增】计算全局 State Matching ====================
-            print("Computing global matched state for DDM²...")
-            
-            # 收集所有数据计算全局 t*（单张图场景）
-            all_y_bar = []
-            all_x_orig = []
-            
-            for batch in self.dl:
-                y_bar, x_orig = batch[0], batch[1]
-                all_y_bar.append(y_bar)
-                all_x_orig.append(x_orig)
-            
-            all_y_bar = torch.cat(all_y_bar, dim=0).to(device)
-            all_x_orig = torch.cat(all_x_orig, dim=0).to(device)
-            
-            # 范围转换：如果是 [0,1]，转换为 [-1,1]
-            if all_x_orig.max() <= 1.0 and all_x_orig.min() >= 0.0:
-                print("DEBUG: Detecting [0, 1] input, converting to [-1, 1]...")
-                all_x_orig = all_x_orig * 2.0 - 1.0
-                all_y_bar = all_y_bar * 2.0 - 1.0
-            
-            # 获取底层模型
-            model_unwrapped = self.accelerator.unwrap_model(self.model)
-            
-            with torch.no_grad():
-                t_star = model_unwrapped.state_matching(all_x_orig, all_y_bar, mode='mean')
-            
-            # 设置 matched state
-            model_unwrapped.set_matched_state(t_star)
-            print(f"Global State Matching complete: t* = {t_star}")
-            # ==================== State Matching 结束 ====================
-            
             self.scheduler.step_size = 1
             val_loss = np.inf
             val_diffusion_loss = np.inf
@@ -1409,8 +1427,13 @@ class Trainer(object):
                         # dataloader 返回: (y_bar, X_original)
                         batch_ybar, batch_x_orig = batch
 
-                        y_bar = batch_ybar.to(device)        # N2N 输出
-                        x_orig = batch_x_orig.to(device)     # 原始 noisy X
+                        y_bar = batch_ybar.to(device)
+                        x_orig = batch_x_orig.to(device)
+                        
+                        # 范围转换：[0,1] -> [-1,1]
+                        if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
+                            x_orig = x_orig * 2.0 - 1.0
+                            y_bar = y_bar * 2.0 - 1.0
 
                         with self.accelerator.autocast():
                             # 调用新定义的 forward(y_bar, original_X)
@@ -1618,7 +1641,7 @@ class Sampler(object):
                     x_orig_sample = x_orig_sample * 2.0 - 1.0
                     y_bar_sample = y_bar_sample * 2.0 - 1.0
                 
-                start_t = self.ema.ema_model.state_matching(x_orig_sample, y_bar_sample, mode='mean')
+                start_t = self.ema.ema_model.state_matching(x_orig_sample, y_bar_sample)
                 print(f"Global State Matching: t* = {start_t}")
             # ==================== State Matching 结束 ====================
 
@@ -1650,11 +1673,12 @@ class Sampler(object):
                         x_orig = x_orig * 2.0 - 1.0
                         y_bar = y_bar * 2.0 - 1.0
                 
-                # DDM² 去噪
+                # DDM² 去噪（开启 flip）
                 pred_batch = self.ema.ema_model.ddm2_denoise(
                     noisy_image=x_orig,
                     y_bar=y_bar,
-                    start_t=start_t
+                    start_t=start_t,
+                    use_flip=True  # 使用 flip augmentation
                 )
                 
                 if batch_start == 0:
