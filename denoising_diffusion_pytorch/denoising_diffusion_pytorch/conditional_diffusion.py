@@ -1192,71 +1192,80 @@ class GaussianDiffusion(nn.Module):
 
     def p_losses(self, y_bar, original_X, t, matched_state):
         """
-        DDM² Stage III（离散 t 版本；不做 continuous）
-        保持你的 forward 不变：t 和 matched_state 由外部传入
+        t: 0..T-1   (训练/模型/extract 一律用它)
+        matched_state: 1..T  (Stage2 输出，给 sqrt_alphas_cumprod_prev 用)
         """
         B = y_bar.shape[0]
         device = original_X.device
+        dtype = original_X.dtype
+        T = self.num_timesteps
 
         y_bar = y_bar.detach()
-        matched_state = matched_state.view(-1).long()
+        matched_state = matched_state.view(-1).long().clamp(1, T)  # 1..T
 
-        # fixed alpha from matched_state (sqrt(alpha_bar))
-        fixed_alpha_1d = self.sqrt_alphas_cumprod_prev.to(device)[matched_state]  # (B,)
+        # ---- 统一 alpha_prev 为 tensor，避免 numpy/.to(device) 崩
+        alpha_prev = self.sqrt_alphas_cumprod_prev
+        if not torch.is_tensor(alpha_prev):
+            alpha_prev = torch.as_tensor(alpha_prev, device=device, dtype=dtype)
+        else:
+            alpha_prev = alpha_prev.to(device=device, dtype=dtype)  # (T+1,)
 
-        # reshape to image dims
-        fixed_alpha = fixed_alpha_1d.view(B, *([1] * (y_bar.ndim - 1)))  # (B,1,1,1) / (B,1,1,1,1)
+        # fixed alpha from matched_state (sqrt(alpha_bar))   matched_state in [1..T]
+        fixed_alpha_1d = alpha_prev[matched_state]  # (B,)
+        fixed_alpha = fixed_alpha_1d.view(B, *([1] * (y_bar.ndim - 1)))
 
         # eps_raw = (X - a*y)/sqrt(1-a^2)
         denom = (1.0 - fixed_alpha * fixed_alpha).clamp_min(1e-12).sqrt()
         eps_raw = (original_X - fixed_alpha * y_bar) / denom
 
-        # Eq4 mean (必须用 eps_raw 的均值，不然没法校正 y_bar)
+        # Eq4 mean
         eps_mean = eps_raw.mean(dim=tuple(range(1, eps_raw.ndim)), keepdim=True)
 
-        # zero-mean eps（直接复用你的 helper）
-        noise = self.residual_eps(original_X, y_bar, fixed_alpha)
+        # zero-mean eps
+        noise = self.residual_eps(original_X, y_bar, fixed_alpha)  # 你保留的 helper
 
-        # calibrate y_bar (repo: x_start = x_start + mean*sqrt(1-a^2)/a)
+        # calibrate y_bar
         y_bar_corrected = y_bar + eps_mean.detach() * denom / fixed_alpha.clamp_min(1e-12)
 
-        # noise shuffle（repo：同一个 randperm 作用在所有样本/通道）
+        # noise shuffle（同一个 randperm）
         noise_flat = noise.view(B, noise.shape[1], -1)
         rand_idx = torch.randperm(noise_flat.shape[-1], device=device)
         noise_shuffled = noise_flat[:, :, rand_idx].view_as(noise).detach()
 
-        # construct S_t with *discrete* t (standard DDPM form)
-        # ---- use repo-style noise level table: sqrt_alphas_cumprod_prev (len = T+1, index 0..T)
-        # forward 里你采样的是 [1..T]，这里直接 clamp 保底
-        t_idx = t.view(-1).long().clamp(min=1, max=self.num_timesteps)  # (B,)
+        # ---- t 是 0..T-1，但 alpha_prev 是 0..T 的表，所以用 t_idx = t+1
+        t0 = t.view(-1).long().clamp(0, T - 1)      # 0..T-1
+        t_idx = t0 + 1                               # 1..T
 
-        alpha_prev = self.sqrt_alphas_cumprod_prev.to(device)  # (T+1,)
-        sqrt_alpha_t = alpha_prev[t_idx].view(B, *([1] * (y_bar.ndim - 1)))  # (B,1,1,1)/(B,1,1,1,1)
+        sqrt_alpha_t = alpha_prev[t_idx].view(B, *([1] * (y_bar.ndim - 1)))
         sqrt_one_minus_alpha_t = (1.0 - sqrt_alpha_t * sqrt_alpha_t).clamp_min(1e-12).sqrt()
 
         S_t = sqrt_alpha_t * y_bar_corrected + sqrt_one_minus_alpha_t * noise_shuffled
 
+        # ✅ 模型和 extract 一律用 0-based t0
+        model_out = self.model(S_t, t0)
 
-        # model prediction
-        model_out = self.model(S_t, t)
-
-        # loss
         target = original_X
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
+        # loss_weight：按长度选用 t0 / t_idx
         if hasattr(self, "loss_weight"):
             lw = self.loss_weight
-            # 如果 loss_weight 是 (T+1,) 就用同一套 t_idx
-            if torch.is_tensor(lw) and lw.ndim == 1 and lw.shape[0] == self.num_timesteps + 1:
-                w = lw.to(device)[t_idx]                  # (B,)
-                w = w.view(B, *([1] * (loss.ndim - 1)))   # broadcast 到 loss shape
+            if torch.is_tensor(lw) and lw.ndim == 1:
+                if lw.shape[0] == T + 1:
+                    w = lw.to(device)[t_idx]  # 1..T
+                elif lw.shape[0] == T:
+                    w = lw.to(device)[t0]     # 0..T-1
+                else:
+                    raise ValueError(f"loss_weight length {lw.shape[0]} not match T/T+1")
+                w = w.view(B, *([1] * (loss.ndim - 1)))
                 loss = loss * w
             else:
-                # 否则保持你原来的 extract（前提是 extract 与 lw 的索引一致）
-                loss = loss * extract(self.loss_weight, t, loss.shape)
+                # 如果你 insist 用 extract，也一定要喂 t0（0-based）
+                loss = loss * extract(self.loss_weight, t0, loss.shape)
 
         return loss.mean(), model_out, target
+
    
     
     def forward(self, y_bar, original_X, *args, **kwargs):
@@ -1278,7 +1287,7 @@ class GaussianDiffusion(nn.Module):
         matched_state = matched_state.view(-1).long()
         
         # 随机采样 t
-        t = torch.randint(1, self.num_timesteps + 1, (b,), device=device).long()
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         
         # 调用 p_losses
         loss, model_out, target = self.p_losses(y_bar, original_X, t, matched_state)
