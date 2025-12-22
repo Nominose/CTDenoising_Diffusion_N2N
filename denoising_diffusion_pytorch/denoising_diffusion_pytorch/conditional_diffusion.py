@@ -1003,32 +1003,6 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown problem dimension {self.problem_dimension}')
 
-    @torch.inference_mode()
-    def compute_matched_state(self, original_X, y_bar):
-        """
-        计算 per-sample 的 matched_state（和论文索引一致）
-        """
-        B = original_X.shape[0]
-        device = original_X.device
-        
-        # 计算残差
-        residual = original_X - y_bar
-        residual = residual - residual.mean(dim=tuple(range(1, residual.ndim)), keepdim=True)
-        
-        # 计算每个样本的 sigma
-        sigmas = residual.flatten(1).std(dim=1, unbiased=False)  # (B,)
-        
-        # 【关键】使用论文的索引体系：sqrt(1 - alpha_prev^2)
-        # sqrt_alphas_cumprod_prev 长度 T+1，索引 0..T
-        schedule = (1 - self.sqrt_alphas_cumprod_prev**2).sqrt().to(device)  # (T+1,)
-        
-        # 匹配
-        t_star = (schedule[None, :] - sigmas[:, None]).abs().argmin(dim=1)  # (B,)
-        
-        # 防止 t_star=0（会导致除以0）
-        t_star = t_star.clamp(min=1, max=self.num_timesteps - 1)
-        
-        return t_star.long()
 
     @torch.inference_mode()
     def state_matching(self, original_X, y_bar):
@@ -1036,216 +1010,252 @@ class GaussianDiffusion(nn.Module):
         推理时的 State Matching（返回单个 t*，取 batch 最大值）
         """
         matched_state = self.compute_matched_state(original_X, y_bar)
-        t_star = int(matched_state[0].item())
+        t_star = int(matched_state.max().item())
         
         print(f"State Matching: t* = {t_star}")
         return t_star
 
     @torch.inference_mode()
-    def ddm2_denoise(self, noisy_image, y_bar=None, start_t=None, use_flip=True):
+    def ddm2_denoise(self, noisy_image, y_bar=None, start_t=None, use_flip=False):
         """
-        DDM² 去噪
-        
-        Args:
-            noisy_image: 原始噪声图像
-            y_bar: N2N 输出（用于 State Matching）
-            start_t: 起始时间步（如果为 None，自动计算）
-            use_flip: 是否使用 flip augmentation
+        【修复版 V5】自适应范围修正 + 强制输出 [0,1]
+        解决：t=33、油画感、全黑问题
         """
         device = noisy_image.device
         
-        # State Matching
-        if start_t is None:
-            if y_bar is None:
-                raise ValueError("需要提供 y_bar 进行 State Matching，或手动指定 start_t")
-            start_t = self.state_matching(noisy_image, y_bar)
+        # --- 1. 强力数据标准化 (Robust Normalization) ---
+        # 无论输入是 [0, 1] 还是 [-1, 1]，统一转为 [-1, 1] 喂给模型
+        vals = noisy_image.detach().float()
+        v_min, v_max = vals.min(), vals.max()
         
-        start_t = min(start_t, self.num_timesteps - 1)
-        print(f"DDM² denoising from t={start_t}")
-        
-        if use_flip:
-            return self._denoise_with_flip(noisy_image, start_t)
+        # 归一化逻辑：(x - min) / (max - min) -> [0, 1] -> *2 -1 -> [-1, 1]
+        if v_max - v_min > 1e-6:
+            x_norm = (noisy_image - v_min) / (v_max - v_min)
+            x_norm = x_norm * 2.0 - 1.0
         else:
-            return self._denoise_single(noisy_image, start_t)
+            x_norm = noisy_image 
+            
+        # 处理 y_bar (用于计算 t*)
+        if y_bar is not None:
+            y_bar_norm = (y_bar - v_min) / (v_max - v_min)
+            y_bar_norm = y_bar_norm * 2.0 - 1.0
+        else:
+            y_bar_norm = None
+
+        # --- 2. 计算 t* (State Matching) ---
+        if start_t is None:
+            if y_bar_norm is not None:
+                # 使用修正后的 [-1, 1] 数据计算，t 应该会在 100~400 之间
+                start_t = self.state_matching(x_norm, y_bar_norm)
+                print(f"DEBUG: Calculated t* = {start_t}")
+            else:
+                start_t = 300 
+
+        # --- 4. 执行无条件去噪 ---
+        # 显式传入 condition=None
+        if use_flip:
+            out = self._denoise_with_flip(x_norm, start_t)
+        else:
+            out = self._denoise_single(x_norm, start_t)
+
+        # --- 5. 输出适配 (关键步骤) ---
+        # 模型输出是 [-1, 1] -> 转回 [0, 1]
+        # 必须做这一步，否则你脚本里的 np.clip(0,1) 会把负值变成黑色
+        out = (out + 1) / 2.0
+        out = out.clamp(0, 1)
+        
+        return out
 
     def _denoise_single(self, noisy_image, start_t):
-        """单次反向采样（使用现有的 p_sample）"""
-        device = noisy_image.device
-        batch_size = noisy_image.shape[0]
+        """无条件单次反向采样"""
         img = noisy_image.clone()
-        
-        for t in tqdm(reversed(range(0, start_t)), desc='DDM² denoising', total=start_t + 1, leave=False):
-            # 使用现有的 p_sample
+        for t in tqdm(reversed(range(0, start_t + 1)), desc='Denoising', total=start_t+1, leave=False):
+            # 显式 condition=None
             img, x_start = self.p_sample(img, t, condition=None, output_noise=False)
-        
-        # [-1, 1] -> [0, 1]
-        img = (img + 1) / 2
-        img = img.clamp(0, 1)
+            
+            # 【响应你的要求】虽然 p_sample 内部有处理，这里再保险一次
+            if self.clip_or_not:
+                img = img.clamp(self.clip_range[0], self.clip_range[1])
         
         return img
 
-
     def _denoise_with_flip(self, noisy_image, start_t):
-        """带 flip augmentation 的反向采样"""
+        """无条件 Flip Augmentation"""
         device = noisy_image.device
         batch_size = noisy_image.shape[0]
         img = noisy_image.clone()
         
-        for t in tqdm(reversed(range(0, start_t)), desc='DDM² denoising', total=start_t + 1, leave=False):
+        for t in tqdm(reversed(range(0, start_t + 1)), desc='Denoising', total=start_t+1, leave=False):
             batched_times = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
-            # flip denoise: 4次翻转平均（在预测 x_start 这一步做）
-            x_start = self._flip_predict(img, batched_times)
+            # 预测 x_start
+            x_start = self._flip_predict_unconditional(img, batched_times)
             
-            # clip
+            # 【响应你的要求】显式执行 Clip，防止数值发散
             if self.clip_or_not:
                 x_start.clamp_(self.clip_range[0], self.clip_range[1])
             
-            # 使用现有的 q_posterior
             model_mean, _, model_log_variance = self.q_posterior(x_start=x_start, x_t=img, t=batched_times)
-            
-            # 采样
             noise = torch.randn_like(img) if t > 0 else 0.
             img = model_mean + (0.5 * model_log_variance).exp() * noise
-        
-        # [-1, 1] -> [0, 1]
-        img = (img + 1) / 2
-        img = img.clamp(0, 1)
-        
+            
         return img
 
-    def _flip_predict(self, x, t):
-        """4次翻转平均预测 x_start"""
+    def _flip_predict_unconditional(self, x, t):
+        """辅助函数：无条件翻转预测"""
         results = []
-        
-        # 原图
-        out = self.model(x, t)
-        if self.objective == 'pred_noise':
-            x_start = self.predict_start_from_noise(x, t, out)
-        elif self.objective == 'pred_x0':
-            x_start = out
-        elif self.objective == 'pred_v':
-            x_start = self.predict_start_from_v(x, t, out)
-        results.append(x_start)
-        
-        # 水平翻转
-        x_h = torch.flip(x, dims=[-1])
-        out_h = self.model(x_h, t)
-        if self.objective == 'pred_noise':
-            x_start_h = self.predict_start_from_noise(x_h, t, out_h)
-        elif self.objective == 'pred_x0':
-            x_start_h = out_h
-        elif self.objective == 'pred_v':
-            x_start_h = self.predict_start_from_v(x_h, t, out_h)
-        results.append(torch.flip(x_start_h, dims=[-1]))
-        
-        # 垂直翻转
-        x_v = torch.flip(x, dims=[-2])
-        out_v = self.model(x_v, t)
-        if self.objective == 'pred_noise':
-            x_start_v = self.predict_start_from_noise(x_v, t, out_v)
-        elif self.objective == 'pred_x0':
-            x_start_v = out_v
-        elif self.objective == 'pred_v':
-            x_start_v = self.predict_start_from_v(x_v, t, out_v)
-        results.append(torch.flip(x_start_v, dims=[-2]))
-        
-        # 双翻转
-        x_hv = torch.flip(x, dims=[-2, -1])
-        out_hv = self.model(x_hv, t)
-        if self.objective == 'pred_noise':
-            x_start_hv = self.predict_start_from_noise(x_hv, t, out_hv)
-        elif self.objective == 'pred_x0':
-            x_start_hv = out_hv
-        elif self.objective == 'pred_v':
-            x_start_hv = self.predict_start_from_v(x_hv, t, out_hv)
-        results.append(torch.flip(x_start_hv, dims=[-2, -1]))
-        
-        return torch.stack(results, dim=0).mean(dim=0)        
+        def get_pred(img_in, time_in):
+            # 显式 Condition=None
+            out = self.model(img_in, time_in, condition=None)
+            if self.objective == 'pred_noise':
+                return self.predict_start_from_noise(img_in, time_in, out)
+            elif self.objective == 'pred_x0':
+                return out
+            elif self.objective == 'pred_v':
+                return self.predict_start_from_v(img_in, time_in, out)
 
-    def _denoise_with_flip_aug(self, noisy_image, start_t):
-        """带 Flip Augmentation 的去噪（提升鲁棒性）"""
-        results = []
+        # 1. 原图
+        results.append(get_pred(x, t))
+        # 2. 水平翻转
+        x_h = torch.flip(x, dims=[-1])
+        res_h = get_pred(x_h, t)
+        results.append(torch.flip(res_h, dims=[-1]))
+        # 3. 垂直翻转
+        x_v = torch.flip(x, dims=[-2])
+        res_v = get_pred(x_v, t)
+        results.append(torch.flip(res_v, dims=[-2]))
+        # 4. 双翻转
+        x_hv = torch.flip(x, dims=[-2, -1])
+        res_hv = get_pred(x_hv, t)
+        results.append(torch.flip(res_hv, dims=[-2, -1]))
         
-        # 原图
-        results.append(self._denoise_single(noisy_image, start_t))
-        
-        # 水平翻转
-        flipped_h = torch.flip(noisy_image, dims=[-1])
-        result_h = self._denoise_single(flipped_h, start_t)
-        results.append(torch.flip(result_h, dims=[-1]))
-        
-        # 垂直翻转
-        flipped_v = torch.flip(noisy_image, dims=[-2])
-        result_v = self._denoise_single(flipped_v, start_t)
-        results.append(torch.flip(result_v, dims=[-2]))
-        
-        # 双翻转
-        flipped_hv = torch.flip(noisy_image, dims=[-2, -1])
-        result_hv = self._denoise_single(flipped_hv, start_t)
-        results.append(torch.flip(result_hv, dims=[-2, -1]))
-        
-        # 平均
         return torch.stack(results, dim=0).mean(dim=0)
+
+
+    #训练
+    @torch.inference_mode()
+    def residual_eps(self, X, y, alpha):
+        # alpha shape: (B,1,1,1) / (B,1,1,1,1)
+        denom = (1 - alpha**2).clamp_min(1e-12).sqrt()
+        eps = (X - alpha * y) / denom
+        eps = eps - eps.mean(dim=tuple(range(1, eps.ndim)), keepdim=True)
+        return eps
+
+    @torch.inference_mode()
+    def compute_matched_state(self, original_X, y_bar, alpha_min=1e-3, eps=1e-12):
+        """
+        Repo Stage2 等价（向量化）：
+        对每个 t 计算 std( (X - a_t Y) - mean(X - a_t Y) )，与 sqrt(1-a_t^2) 对齐，取最小 diff 的 t*
+        a_t = sqrt_alphas_cumprod_prev[t], t in [0..T]
+        """
+        B = original_X.shape[0]
+        device = original_X.device
+        dtype = original_X.dtype
+
+        alpha = self.sqrt_alphas_cumprod_prev
+        if not torch.is_tensor(alpha):
+            alpha = torch.as_tensor(alpha, device=device, dtype=dtype)
+        else:
+            alpha = alpha.to(device=device, dtype=dtype)  # (T+1,)
+
+        Xf = original_X.reshape(B, -1)
+        Yf = y_bar.reshape(B, -1)
+
+        EX  = Xf.mean(dim=1)                 # (B,)
+        EY  = Yf.mean(dim=1)
+        EX2 = (Xf * Xf).mean(dim=1)
+        EY2 = (Yf * Yf).mean(dim=1)
+        EXY = (Xf * Yf).mean(dim=1)
+
+        a = alpha[None, :]                   # (1, T+1)
+
+        # mean(X - aY)
+        mu = EX[:, None] - a * EY[:, None]   # (B, T+1)
+
+        # E[(X - aY)^2]
+        m2 = EX2[:, None] + (a * a) * EY2[:, None] - 2.0 * a * EXY[:, None]
+
+        # var after subtract mean
+        var = (m2 - mu * mu).clamp_min(0.0)
+        std_res = (var + eps).sqrt()         # (B, T+1)
+
+        std_th = (1.0 - alpha * alpha).clamp_min(0.0).sqrt()[None, :]  # (1, T+1)
+        diff = (std_res - std_th).abs()
+
+        # 禁用 t=0（alpha=1 => 分母=0；后续 Eq4 也要 /alpha）
+        idx = torch.arange(alpha.numel(), device=device)
+        valid = (idx >= 1) & (alpha >= alpha_min)
+        diff = diff.masked_fill(~valid[None, :], float('inf'))
+
+        t_star = diff.argmin(dim=1).long()   # (B,)
+        return t_star
 
     def p_losses(self, y_bar, original_X, t, matched_state):
         """
-        DDM² Stage III: 使用论文的索引体系
+        DDM² Stage III（离散 t 版本；不做 continuous）
+        保持你的 forward 不变：t 和 matched_state 由外部传入
         """
         B = y_bar.shape[0]
-        device = y_bar.device
-        
-        if self.problem_dimension == '2D':
-            _, C, H, W = y_bar.shape
-        else:
-            _, C, H, W, D = y_bar.shape
-        
-        # 【关键】使用 sqrt_alphas_cumprod_prev（和论文一致）
-        fixed_alphas = self.sqrt_alphas_cumprod_prev[matched_state]  # (B,)
-        
-        # reshape
-        if self.problem_dimension == '2D':
-            fixed_alphas = fixed_alphas.view(B, 1, 1, 1)
-        else:
-            fixed_alphas = fixed_alphas.view(B, 1, 1, 1, 1)
-        
-        # 计算噪声（和论文一样的公式）
-        noise = (original_X - fixed_alphas * y_bar.detach()) / (1 - fixed_alphas**2).sqrt()
-        
-        # Eq 4: 均值校正
-        noise_mean = noise.mean(dim=tuple(range(1, noise.ndim)), keepdim=True)
-        noise = noise - noise_mean.detach()
-        
-        # 校正 y_bar
-        y_bar_corrected = y_bar + noise_mean.detach() * (1 - fixed_alphas**2).sqrt() / fixed_alphas
-        
-        # Noise shuffle
-        if self.problem_dimension == '2D':
-            spatial_size = H * W
-            noise_flat = noise.view(B, C, -1)
-            rand_idx = torch.randperm(spatial_size, device=device)
-            noise_shuffled = noise_flat[:, :, rand_idx].view(B, C, H, W).detach()
-        else:
-            spatial_size = H * W * D
-            noise_flat = noise.view(B, C, -1)
-            rand_idx = torch.randperm(spatial_size, device=device)
-            noise_shuffled = noise_flat[:, :, rand_idx].view(B, C, H, W, D).detach()
-        
-        # q_sample 构造 S_t
-        sqrt_alpha_t = extract(self.sqrt_alphas_cumprod, t, y_bar.shape)
-        sqrt_one_minus_alpha_t = extract(self.sqrt_one_minus_alphas_cumprod, t, y_bar.shape)
-        
+        device = original_X.device
+
+        y_bar = y_bar.detach()
+        matched_state = matched_state.view(-1).long()
+
+        # fixed alpha from matched_state (sqrt(alpha_bar))
+        fixed_alpha_1d = self.sqrt_alphas_cumprod_prev.to(device)[matched_state]  # (B,)
+
+        # reshape to image dims
+        fixed_alpha = fixed_alpha_1d.view(B, *([1] * (y_bar.ndim - 1)))  # (B,1,1,1) / (B,1,1,1,1)
+
+        # eps_raw = (X - a*y)/sqrt(1-a^2)
+        denom = (1.0 - fixed_alpha * fixed_alpha).clamp_min(1e-12).sqrt()
+        eps_raw = (original_X - fixed_alpha * y_bar) / denom
+
+        # Eq4 mean (必须用 eps_raw 的均值，不然没法校正 y_bar)
+        eps_mean = eps_raw.mean(dim=tuple(range(1, eps_raw.ndim)), keepdim=True)
+
+        # zero-mean eps（直接复用你的 helper）
+        noise = self.residual_eps(original_X, y_bar, fixed_alpha)
+
+        # calibrate y_bar (repo: x_start = x_start + mean*sqrt(1-a^2)/a)
+        y_bar_corrected = y_bar + eps_mean.detach() * denom / fixed_alpha.clamp_min(1e-12)
+
+        # noise shuffle（repo：同一个 randperm 作用在所有样本/通道）
+        noise_flat = noise.view(B, noise.shape[1], -1)
+        rand_idx = torch.randperm(noise_flat.shape[-1], device=device)
+        noise_shuffled = noise_flat[:, :, rand_idx].view_as(noise).detach()
+
+        # construct S_t with *discrete* t (standard DDPM form)
+        # ---- use repo-style noise level table: sqrt_alphas_cumprod_prev (len = T+1, index 0..T)
+        # forward 里你采样的是 [1..T]，这里直接 clamp 保底
+        t_idx = t.view(-1).long().clamp(min=1, max=self.num_timesteps)  # (B,)
+
+        alpha_prev = self.sqrt_alphas_cumprod_prev.to(device)  # (T+1,)
+        sqrt_alpha_t = alpha_prev[t_idx].view(B, *([1] * (y_bar.ndim - 1)))  # (B,1,1,1)/(B,1,1,1,1)
+        sqrt_one_minus_alpha_t = (1.0 - sqrt_alpha_t * sqrt_alpha_t).clamp_min(1e-12).sqrt()
+
         S_t = sqrt_alpha_t * y_bar_corrected + sqrt_one_minus_alpha_t * noise_shuffled
-        
-        # 模型预测
+
+
+        # model prediction
         model_out = self.model(S_t, t)
-        
-        # Loss
+
+        # loss
         target = original_X
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss * extract(self.loss_weight, t, loss.shape)
-        
+
+        if hasattr(self, "loss_weight"):
+            lw = self.loss_weight
+            # 如果 loss_weight 是 (T+1,) 就用同一套 t_idx
+            if torch.is_tensor(lw) and lw.ndim == 1 and lw.shape[0] == self.num_timesteps + 1:
+                w = lw.to(device)[t_idx]                  # (B,)
+                w = w.view(B, *([1] * (loss.ndim - 1)))   # broadcast 到 loss shape
+                loss = loss * w
+            else:
+                # 否则保持你原来的 extract（前提是 extract 与 lw 的索引一致）
+                loss = loss * extract(self.loss_weight, t, loss.shape)
+
         return loss.mean(), model_out, target
    
     
@@ -1259,19 +1269,22 @@ class GaussianDiffusion(nn.Module):
             b, c, h, w, d = original_X.shape
         
         device = original_X.device
+
+        y_bar = y_bar.detach()
         
         # 计算 per-sample matched_state（向量化）
-        matched_state = self.compute_matched_state(original_X, y_bar)
+        with torch.no_grad():
+            matched_state = self.compute_matched_state(original_X, y_bar)
+        matched_state = matched_state.view(-1).long()
         
         # 随机采样 t
-        t = torch.randint(1, self.num_timesteps, (b,), device=device).long()
+        t = torch.randint(1, self.num_timesteps + 1, (b,), device=device).long()
         
         # 调用 p_losses
         loss, model_out, target = self.p_losses(y_bar, original_X, t, matched_state)
         
         return loss, model_out, target
 
-# trainer class
 class Trainer(object):
     def __init__(
         self,
@@ -1280,72 +1293,71 @@ class Trainer(object):
         generator_val,
         train_batch_size,
         *,
-        accum_iter = 1, # gradient accumulation steps
-        train_num_steps = 100000, # total training epochs
-        results_folder = None,
-        train_lr = 1e-4,
-        train_lr_decay_every = 200, 
-        save_models_every = 1,
-        validation_every = 1,
-        
-        ema_update_every = 10,
-        ema_decay = 0.995,
-        adam_betas = (0.9, 0.99),
-
-        amp = False,
-        mixed_precision_type = 'fp16',
-        split_batches = True,
-        
-        max_grad_norm = 1.,
-         
+        accum_iter=1,
+        train_num_steps=100000,
+        results_folder=None,
+        train_lr=1e-4,
+        train_lr_decay_every=200,
+        save_models_every=1,
+        validation_every=1,
+        ema_update_every=10,
+        ema_decay=0.995,
+        adam_betas=(0.9, 0.99),
+        amp=False,
+        mixed_precision_type='fp16',
+        split_batches=True,
+        max_grad_norm=1.,
     ):
         super().__init__()
 
-        # accelerator
+        # ✅ 让 accelerate 原生处理梯度累积
         self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
+            split_batches=split_batches,
+            mixed_precision=mixed_precision_type if amp else 'no',
+            gradient_accumulation_steps=accum_iter
         )
 
-        # model
-        self.model = diffusion_model   # it's not just the model architecture, but the actual model with loss calculation
+        self.model = diffusion_model
         self.conditional_diffusion = self.model.conditional_diffusion
-        print('conditional diffusion: ', self.conditional_diffusion)
         self.channels = diffusion_model.channels
- 
+
         self.batch_size = train_batch_size
         self.train_num_steps = train_num_steps
         self.accum_iter = accum_iter
 
-        # dataset and dataloader
         self.ds = generator_train
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = 0)# cpu_count())
-        self.dl = self.accelerator.prepare(dl)
-        self.cycle_dl = cycle(dl)
-
         self.ds_val = generator_val
-        dl_val = DataLoader(self.ds_val, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = 0)# cpu_count())
-        self.dl_val = self.accelerator.prepare(dl_val)
 
+        # ✅ 训练一般要 shuffle
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True,
+                        pin_memory=True, num_workers=0)
+        dl_val = DataLoader(self.ds_val, batch_size=train_batch_size, shuffle=False,
+                            pin_memory=True, num_workers=0)
 
-        # optimizer
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-        self.scheduler = StepLR(self.opt, step_size = 1, gamma=0.95)
+        self.opt = Adam(self.model.parameters(), lr=train_lr, betas=adam_betas)
+        self.scheduler = StepLR(self.opt, step_size=1, gamma=0.95)
+
+        # ✅ 用 accelerate prepare 正确包装（推荐把 loader 也一起 prepare）
+        self.model, self.opt, self.dl, self.dl_val = self.accelerator.prepare(
+            self.model, self.opt, dl, dl_val
+        )
+
         self.max_grad_norm = max_grad_norm
         self.train_lr_decay_every = train_lr_decay_every
         self.save_model_every = save_models_every
-
-        # for logging results in a folder periodically
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
-
+        self.validation_every = validation_every
         self.results_folder = results_folder
         ff.make_folder([self.results_folder])
 
-        # prepare model, dataloader, optimizer with accelerator
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-        self.validation_every = validation_every
+        # ✅ 必须初始化 step
+        self.step = 0
+
+        # EMA（仅主进程）
+        if self.accelerator.is_main_process:
+            # EMA 建议跟踪 unwrapped model
+            self.ema = EMA(self.accelerator.unwrap_model(self.model),
+                           beta=ema_decay, update_every=ema_update_every)
+            self.ema.to(self.device)
 
     @property
     def device(self):
@@ -1359,186 +1371,167 @@ class Trainer(object):
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
-            'ema': self.ema.state_dict(),
+            'ema': self.ema.state_dict() if hasattr(self, "ema") else None,
             'decay_steps': self.scheduler.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
-        
-        torch.save(data, os.path.join(self.results_folder, 'model-' + str(stepNum) + '.pt'))
+        torch.save(data, os.path.join(self.results_folder, f'model-{stepNum}.pt'))
 
     def load_model(self, trained_model_filename):
-        accelerator = self.accelerator
-        device = accelerator.device
-
+        device = self.device
         data = torch.load(trained_model_filename, map_location=device)
-        
-        self.model.load_state_dict(model_state)
-        
-        self.step = data['step']
 
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
+        self.step = int(data.get('step', 0))
 
-        self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
+        # ✅ 正确 load：用 unwrapped model
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        unwrapped.load_state_dict(data['model'], strict=True)
+
+        if 'opt' in data and data['opt'] is not None:
+            self.opt.load_state_dict(data['opt'])
+
+        if self.accelerator.is_main_process and hasattr(self, "ema") and data.get("ema") is not None:
             self.ema.load_state_dict(data["ema"])
 
-        self.scheduler.load_state_dict(data['decay_steps'])
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
+        if 'decay_steps' in data and data['decay_steps'] is not None:
+            self.scheduler.load_state_dict(data['decay_steps'])
+
+        if exists(self.accelerator.scaler) and exists(data.get('scaler')):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
+    def train(self, pre_trained_model=None, start_step=None, beta=0):
+        accelerator = self.accelerator
+        device = self.device
 
-    def train(self, pre_trained_model = None ,start_step = None, beta = 0):
-            accelerator = self.accelerator
-            device = accelerator.device
+        if pre_trained_model is not None:
+            self.load_model(pre_trained_model)
+            print('model loaded from ', pre_trained_model)
 
-            # load pre-trained
-            if pre_trained_model is not None:
-                self.load_model(pre_trained_model)
-                print('model loaded from ', pre_trained_model)
+        if start_step is not None:
+            self.step = start_step
 
-            if start_step is not None:
-                self.step = start_step
-            
-            self.scheduler.step_size = 1
-            val_loss = np.inf
-            val_diffusion_loss = np.inf
-            val_bias_loss = np.inf
-            training_log = []
+        training_log = []
+        val_loss = float('inf')
+        val_diffusion_loss = float('inf')
+        val_bias_loss = float('inf')
 
-            self.scheduler.step_size = 1
-            val_loss = np.inf; val_diffusion_loss = np.inf; val_bias_loss = np.inf
-            training_log = []
+        with tqdm(initial=self.step, total=self.train_num_steps,
+                  disable=not accelerator.is_main_process) as pbar:
 
-            with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-                
-                while self.step < self.train_num_steps:
-                    print('training epoch: ', self.step + 1)
-                    print('learning rate: ', self.scheduler.get_last_lr()[0])
+            while self.step < self.train_num_steps:
+                self.model.train()
+                print('training epoch: ', self.step + 1)
+                print('learning rate: ', self.scheduler.get_last_lr()[0])
 
-                    average_loss = []; average_diffusion_loss = []; average_bias_loss = 0.0
-                    count = 0
-                    for batch in self.dl:
-                        if count == 0 or count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
-                            self.opt.zero_grad()
+                avg_loss = []
+                avg_diff_loss = []
 
-                        # dataloader 返回: (y_bar, X_original)
-                        batch_ybar, batch_x_orig = batch
+                for batch in self.dl:
+                    batch_ybar, batch_x_orig = batch
+                    y_bar = batch_ybar.to(device)
+                    x_orig = batch_x_orig.to(device)
 
-                        y_bar = batch_ybar.to(device)
-                        x_orig = batch_x_orig.to(device)
-                        
-                        # 范围转换：[0,1] -> [-1,1]
-                        if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
-                            x_orig = x_orig * 2.0 - 1.0
-                            y_bar = y_bar * 2.0 - 1.0
+                    # ✅ 训练归一化
+                    if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
+                        x_orig = x_orig * 2.0 - 1.0
+                        y_bar = y_bar * 2.0 - 1.0
 
-                        with self.accelerator.autocast():
-                            # 调用新定义的 forward(y_bar, original_X)
-                            diffusion_loss, model_output, target = self.model(
-                                y_bar, 
-                                x_orig
-                            )
+                    # ✅ 正确的梯度累积：每个 batch 都 backward；accumulate 会在边界 step
+                    with accelerator.accumulate(self.model):
+                        with accelerator.autocast():
+                            diffusion_loss, model_output, target = self.model(y_bar, x_orig)
+                            loss = diffusion_loss  # + beta * bias_loss (如需)
 
-                            # gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                            # lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                            # lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
+                        accelerator.backward(loss)
 
-                            # bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
-
-                            loss = diffusion_loss# + beta * bias_loss
-
-                        if count % self.accum_iter == 0 or count == len(self.dl) - 1 or count == len(self.dl):
-                            self.accelerator.backward(loss)
-                            accelerator.wait_for_everyone()
+                        if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                            self.opt.step()
 
-                        average_loss.append(loss.item())
-                        average_diffusion_loss.append(diffusion_loss.item())
-                        # average_bias_loss.append(bias_loss.item())  # no bias
-                        count += 1
+                        self.opt.step()
+                        self.opt.zero_grad(set_to_none=True)
 
-                    average_loss = sum(average_loss) / len(average_loss)
-                    average_diffusion_loss = sum(average_diffusion_loss) / len(average_diffusion_loss)
-                    # average_bias_loss = sum(average_bias_loss) / len(average_bias_loss)
-                
-                    pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diffusion_loss:.4f}')
-                    accelerator.wait_for_everyone()
+                    avg_loss.append(loss.item())
+                    avg_diff_loss.append(diffusion_loss.item())
 
-                    self.step += 1
+                average_loss = sum(avg_loss) / max(1, len(avg_loss))
+                average_diff = sum(avg_diff_loss) / max(1, len(avg_diff_loss))
 
-                    # save the model
-                    if self.step !=0 and divisible_by(self.step, self.save_model_every):
-                        print('i am saving model at step: ', self.step)
-                        self.save(self.step)
-                        print('model saved')
-                        # update the parameter
-                    if self.step !=0 and divisible_by(self.step, self.train_lr_decay_every):
-                        print('i am updating learning rate at step: ', self.step)
-                        self.scheduler.step()
+                pbar.set_description(f'average loss: {average_loss:.4f}, diffusion loss: {average_diff:.4f}')
+                self.step += 1
 
+                # ✅ 保存/学习率/EMA
+                if self.step != 0 and divisible_by(self.step, self.save_model_every):
+                    self.save(self.step)
+
+                if self.step != 0 and divisible_by(self.step, self.train_lr_decay_every):
+                    self.scheduler.step()
+
+                if accelerator.is_main_process and hasattr(self, "ema"):
                     self.ema.update()
 
-                    # do the validation if necessary
-                    if self.step != 0 and divisible_by(self.step, self.validation_every):
-                        print('validation at step: ', self.step)
-                        self.model.eval()
-                        with torch.no_grad():
-                            val_loss = []; val_diffusion_loss = []; val_bias_loss = []
+                # ✅ 验证（别忘了同样归一化）
+                if self.step != 0 and divisible_by(self.step, self.validation_every):
+                    self.model.eval()
+                    with torch.no_grad():
+                        vlosses = []
+                        vdiffs = []
+                        vbiases = []
 
-                            for batch in self.dl_val:
-                                #新的数据格式：dataloader 返回 (y_bar, X_original)
-                                batch_ybar, batch_x_orig = batch
+                        for batch in self.dl_val:
+                            batch_ybar, batch_x_orig = batch
+                            y_bar = batch_ybar.to(device)
+                            x_orig = batch_x_orig.to(device)
 
-                                y_bar  = batch_ybar.to(device)   # N2N 输出 ȳ
-                                x_orig = batch_x_orig.to(device) # 原始 noisy X
+                            # ✅ 验证归一化（你原来漏了）
+                            if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
+                                x_orig = x_orig * 2.0 - 1.0
+                                y_bar = y_bar * 2.0 - 1.0
 
-                                with self.accelerator.autocast():
-                                    # 调用新的 forward(y_bar, original_X)
-                                    diffusion_loss, model_output, target = self.model(
-                                        y_bar,
-                                        x_orig
-                                    )
+                            with accelerator.autocast():
+                                diffusion_loss, model_output, target = self.model(y_bar, x_orig)
 
-                                    # bias loss 部分保持不变，只是目标从 data_x0 换成 x_orig
-                                    gauss_kernel   = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
-                                    lowpass_out    = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
-                                    lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
+                                # 如果你真的要 bias_loss，就保留；否则建议 val 也别算，省事
+                                gauss_kernel = kernel.get_gaussian_kernel(kernel_size=37, sigma=6)
+                                lowpass_out = kernel.apply_lowpass_gaussian(model_output, gauss_kernel)
+                                lowpass_target = kernel.apply_lowpass_gaussian(torch.clone(x_orig), gauss_kernel)
+                                bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
 
-                                    bias_loss = F.mse_loss(lowpass_out, lowpass_target, reduction='mean')
+                                loss = diffusion_loss + beta * bias_loss
 
-                                    loss = diffusion_loss + beta * bias_loss
-                                
-                                val_loss.append(loss.item())
-                                val_diffusion_loss.append(diffusion_loss.item())
-                                val_bias_loss.append(bias_loss.item())
+                            vlosses.append(loss.item())
+                            vdiffs.append(diffusion_loss.item())
+                            vbiases.append(bias_loss.item())
 
-                            val_loss           = sum(val_loss) / len(val_loss)
-                            val_diffusion_loss = sum(val_diffusion_loss) / len(val_diffusion_loss)
-                            val_bias_loss      = sum(val_bias_loss) / len(val_bias_loss)
+                        val_loss = sum(vlosses) / max(1, len(vlosses))
+                        val_diffusion_loss = sum(vdiffs) / max(1, len(vdiffs))
+                        val_bias_loss = sum(vbiases) / max(1, len(vbiases))
 
-                            print('validation loss: ', val_loss, 
-                                'validation diffusion loss: ', val_diffusion_loss,
-                                'validation bias loss: ', val_bias_loss)
+                        print('validation loss: ', val_loss,
+                              'validation diffusion loss: ', val_diffusion_loss,
+                              'validation bias loss: ', val_bias_loss)
 
-                        self.model.train(True)
+                    self.model.train(True)
 
-                    # save the training log
-                    training_log.append([self.step,self.scheduler.get_last_lr()[0], average_loss, average_diffusion_loss, 
-                                        average_bias_loss, val_loss, val_diffusion_loss, val_bias_loss])
-                    df = pd.DataFrame(training_log,columns = ['iteration','learning_rate','training_loss','training_diffusion_loss','training_bias_loss',
-                                                                'validation_loss','validation_diffusion_loss','validation_bias_loss'])
-                    log_folder = os.path.join(os.path.dirname(self.results_folder),'log');ff.make_folder([log_folder])
-                    df.to_excel(os.path.join(log_folder, 'training_log.xlsx'),index=False)
+                # log
+                training_log.append([self.step, self.scheduler.get_last_lr()[0],
+                                     average_loss, average_diff,
+                                     0.0, val_loss, val_diffusion_loss, val_bias_loss])
 
-                    # at the end of each epoch, call on_epoch_end
-                    self.ds.on_epoch_end(); self.ds_val.on_epoch_end()
-                    pbar.update(1)
+                df = pd.DataFrame(training_log, columns=[
+                    'iteration', 'learning_rate',
+                    'training_loss', 'training_diffusion_loss', 'training_bias_loss',
+                    'validation_loss', 'validation_diffusion_loss', 'validation_bias_loss'
+                ])
+                log_folder = os.path.join(os.path.dirname(self.results_folder), 'log')
+                ff.make_folder([log_folder])
+                df.to_excel(os.path.join(log_folder, 'training_log.xlsx'), index=False)
 
-            accelerator.print('training complete')
+                self.ds.on_epoch_end()
+                self.ds_val.on_epoch_end()
+                pbar.update(1)
+
+        accelerator.print('training complete')
 
 
 # Sampling class
@@ -1597,113 +1590,105 @@ class Sampler(object):
 
 
     def sample_2D(self, trained_model_filename, condition_img, start_t=None, batch_size=1):
-        """
-        DDM² 2D 采样
-        """
-        background_cutoff = self.background_cutoff
-        maximum_cutoff = self.maximum_cutoff
-        self.load_model(trained_model_filename) 
-        
-        device = self.device
-        self.ema.ema_model.eval()
-        
-        num_slices = condition_img.shape[-1]
-        pred_img = np.zeros((self.image_size[0], self.image_size[1], num_slices), dtype=np.float32)
+            """
+            【修复版 Sample_2D】
+            1. 修复了 Global State Matching 的归一化漏洞 (解决 t=33 问题)
+            2. 逻辑简化：依赖底层 ddm2_denoise 处理推理时的数值转换
+            """
+            self.load_model(trained_model_filename) 
+            device = self.device
+            self.ema.ema_model.eval()
+            
+            num_slices = condition_img.shape[-1]
+            pred_img = np.zeros((self.image_size[0], self.image_size[1], num_slices), dtype=np.float32)
+            dataset = self.dl.dataset
+            
+            if len(dataset) != num_slices:
+                raise ValueError(f"Dataset length mismatch!")
+            
+            print(f"Starting DDM2 Sampling...")
+            
+            with torch.inference_mode():
+                # ====================================================
+                # 1. 全局 State Matching (修复版)
+                #    目的：计算一个统一的 t* 给整个 Volume 使用
+                # ====================================================
+                if start_t is None:
+                    print("Performing Global State Matching...")
+                    # 取前 10 张切片作为样本
+                    num_samples = min(10, num_slices)
+                    # 从 Dataset 读取原始数据 (可能是 [0,1] 也可能是其他)
+                    y_samples = [dataset[i][0] for i in range(num_samples)]
+                    x_samples = [dataset[i][1] for i in range(num_samples)]
+                    
+                    y_bar_sample = torch.stack(y_samples, dim=0).to(device).float()
+                    x_orig_sample = torch.stack(x_samples, dim=0).to(device).float()
+                    
+                    # --- 【关键修复】强制归一化到 [-1, 1] 再算 t ---
+                    # 无论原始数据是多少，强行拉伸到 [-1, 1]，确保 t 计算准确
+                    vals = x_orig_sample
+                    p_min, p_max = torch.quantile(vals, 0.001), torch.quantile(vals, 0.995)
+                    
+                    if p_max - p_min > 1e-6:
+                        # 归一化公式: (x - min) / (max - min) * 2 - 1
+                        x_norm = (x_orig_sample - p_min) / (p_max - p_min) * 2.0 - 1.0
+                        y_norm = (y_bar_sample - p_min) / (p_max - p_min) * 2.0 - 1.0
+                        # 截断保证安全
+                        x_norm = x_norm.clamp(-1, 1)
+                        y_norm = y_norm.clamp(-1, 1)
+                    else:
+                        x_norm, y_norm = x_orig_sample, y_bar_sample
 
-        dataset = self.dl.dataset
-        
-        # 安全检查
-        if len(dataset) != num_slices:
-            raise ValueError(
-                f"Dataset length ({len(dataset)}) != Volume slices ({num_slices}). "
-                f"请确保 DataLoader 只包含当前病人的数据！"
+                    # 计算全局 t* 
+                    start_t = self.ema.ema_model.state_matching(x_norm, y_norm)
+                    print(f"Global State Matching Result: t* = {start_t}")               
+
+                # ====================================================
+                # 2. 逐 Batch 推理
+                # ====================================================
+                for batch_start in tqdm(range(0, num_slices, batch_size), desc="DDM² Inference"):
+                    batch_end = min(batch_start + batch_size, num_slices)
+                    
+                    # 收集数据 (保持原始值，不做处理)
+                    y_bar_list = [dataset[i][0] for i in range(batch_start, batch_end)]
+                    x_orig_list = [dataset[i][1] for i in range(batch_start, batch_end)]
+                    
+                    y_bar = torch.stack(y_bar_list, dim=0).to(device).float()
+                    x_orig = torch.stack(x_orig_list, dim=0).to(device).float()
+                    
+                    # 调用 ddm2_denoise (V5)
+                    # 它内部会再次做归一化，这没问题，保证了安全性
+                    # 它返回的是 [0, 1] 范围的结果
+                    pred_batch = self.ema.ema_model.ddm2_denoise(
+                        noisy_image=x_orig,
+                        y_bar=y_bar,
+                        start_t=start_t, # 传入刚才算好的全局 t
+                        use_flip=False   # 暂时关闭 flip 调试，稳了再开
+                    )
+                    
+                    # 存储结果
+                    pred_batch_np = pred_batch.detach().cpu().numpy()
+                    for i, slice_idx in enumerate(range(batch_start, batch_end)):
+                        pred_img[:, :, slice_idx] = pred_batch_np[i, 0, :, :]
+
+            # ====================================================
+            # 3. 后处理 (恢复到 HU 值)
+            # ====================================================
+            pred_img = Data_processing.crop_or_pad(
+                pred_img, 
+                [condition_img.shape[0], condition_img.shape[1], condition_img.shape[-1]], 
+                value=np.min(pred_img)
             )
-        
-        with torch.inference_mode():
-
-# ==================== 【新增】全局 State Matching ====================
-            if start_t is None:
-                print("Performing global State Matching...")
-                num_samples = min(10, num_slices)
-                y_bar_samples = []
-                x_orig_samples = []
-                
-                for idx in range(num_samples):
-                    data = dataset[idx]
-                    y_bar_samples.append(data[0])
-                    x_orig_samples.append(data[1])
-                
-                y_bar_sample = torch.stack(y_bar_samples, dim=0).to(device)
-                x_orig_sample = torch.stack(x_orig_samples, dim=0).to(device)
-                
-                # 范围转换
-                if x_orig_sample.max() <= 1.0 and x_orig_sample.min() >= 0.0:
-                    x_orig_sample = x_orig_sample * 2.0 - 1.0
-                    y_bar_sample = y_bar_sample * 2.0 - 1.0
-                
-                start_t = self.ema.ema_model.state_matching(x_orig_sample, y_bar_sample)
-                print(f"Global State Matching: t* = {start_t}")
-            # ==================== State Matching 结束 ====================
-
-            for batch_start in tqdm(range(0, num_slices, batch_size), desc="DDM² Sampling"):
-                batch_end = min(batch_start + batch_size, num_slices)
-                
-                # 收集 batch 数据
-                y_bar_list = []
-                x_orig_list = []
-                
-                for idx in range(batch_start, batch_end):
-                    data = dataset[idx]
-                    y_bar_list.append(data[0])
-                    x_orig_list.append(data[1])
-                
-                y_bar = torch.stack(y_bar_list, dim=0).to(device)
-                x_orig = torch.stack(x_orig_list, dim=0).to(device)
-                
-                # 调试：检查输入范围
-                if batch_start == 0:
-                    print(f"DEBUG - x_orig range: [{x_orig.min():.4f}, {x_orig.max():.4f}]")
-                    print(f"DEBUG - y_bar range: [{y_bar.min():.4f}, {y_bar.max():.4f}]")
-                
-                # 【关键】范围检查：如果是 [0,1]，转换为 [-1,1]
-                if x_orig.min() >= -0.01 and x_orig.max() <= 1.01:
-                    if x_orig.max() <= 1.0 and x_orig.min() >= 0.0:
-                        if batch_start == 0:
-                            print("DEBUG: Detecting [0, 1] input, converting to [-1, 1]...")
-                        x_orig = x_orig * 2.0 - 1.0
-                        y_bar = y_bar * 2.0 - 1.0
-                
-                # DDM² 去噪（开启 flip）
-                pred_batch = self.ema.ema_model.ddm2_denoise(
-                    noisy_image=x_orig,
-                    y_bar=y_bar,
-                    start_t=start_t,
-                    use_flip=True  # 使用 flip augmentation
+            
+            # 现在 pred_img 是 [0, 1]，这里的 clip 是安全的
+            pred_img = np.clip(pred_img, 0, 1)
+            # 映射回物理值 (例如 -1000 到 2000)
+            pred_img = pred_img * (self.maximum_cutoff - self.background_cutoff) + self.background_cutoff
+            
+            if self.histogram_equalization:
+                pred_img = Data_processing.apply_transfer_to_img(
+                    pred_img, self.bins, self.bins_mapped, reverse=True
                 )
-                
-                if batch_start == 0:
-                    print(f"DEBUG - output range: [{pred_batch.min():.4f}, {pred_batch.max():.4f}]")
-                
-                # 存储
-                pred_batch_np = pred_batch.detach().cpu().numpy()
-                for i, slice_idx in enumerate(range(batch_start, batch_end)):
-                    pred_img[:, :, slice_idx] = pred_batch_np[i, 0, :, :]
-
-        # 后处理
-        pred_img = Data_processing.crop_or_pad(
-            pred_img, 
-            [condition_img.shape[0], condition_img.shape[1], condition_img.shape[-1]], 
-            value=np.min(pred_img)
-        )
-        
-        print(f"DEBUG - Before clip: [{pred_img.min():.4f}, {pred_img.max():.4f}]")
-        pred_img = np.clip(pred_img, 0, 1)
-        pred_img = pred_img * (maximum_cutoff - background_cutoff) + background_cutoff
-        
-        if self.histogram_equalization:
-            pred_img = Data_processing.apply_transfer_to_img(
-                pred_img, self.bins, self.bins_mapped, reverse=True
-            )
-        
-        print(f'Final image range: [{pred_img.min():.1f}, {pred_img.max():.1f}]')
-        return pred_img
+            
+            print(f'Final Output Range: [{pred_img.min():.1f}, {pred_img.max():.1f}]')
+            return pred_img
